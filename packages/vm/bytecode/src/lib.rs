@@ -11,5 +11,7 @@ pub fn parse(bytes: &[u8]) -> Result<Bytecode> {
     if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
         return Err(anyhow!("invalid bytecode magic"));
     }
-    Ok(Bytecode { payload: bytes.to_vec() })
+    Ok(Bytecode {
+        payload: bytes.to_vec(),
+    })
 }

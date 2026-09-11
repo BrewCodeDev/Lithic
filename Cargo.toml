@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "packages/compiler/lithic-syntax",
   "packages/compiler/lithc",
   "packages/compiler/lithfmt",
   "packages/compiler/lithlint",

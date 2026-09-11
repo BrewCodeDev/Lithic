@@ -1,5 +1,10 @@
 # Lithic Lang Public Framework
 
+Implementation status: the compiler, formatter and linter entrypoints now invoke
+the tested Rust front end. See [current capabilities](../docs/IMPLEMENTATION_STATUS.md)
+and [command changes](../docs/FRONTEND_IMPORT.md). Contract bodies are not compiled;
+the examples below describe intended features, not deployable contracts.
+
 Framework for **Lithic Lang** contract authoring, compiler/runtime design, and LEP100-aligned reference implementations.
 
 

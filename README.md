@@ -53,7 +53,7 @@ It is designed for:
 - Explicit permissions for sensitive ops (AI calls, transfers, syscalls, zk verification)  
 - Principle-of-least-privilege by construction  
 
-### Production-grade tooling
+### Planned tooling
 
 - `lithc` compiler (.lithic → LithoVM bytecode)  
 - `lithfmt` formatter + `lithlint` security lints  
@@ -170,18 +170,9 @@ Contracts MUST explicitly declare sensitive privileges, enabling:
 
 ## Getting Started
 
-    # clone repo
-    git clone https://github.com/KaJLabs/lithosphere.git
-    cd lithosphere/lithic
-
-    # build compiler
-    make build
-
-    # compile contract
-    lithc compile examples/risk_analyzer.lithic
-
-    # run tests
-    make test
+This repository currently contains development scaffolds, not a production
+compiler or deployable VM. Read [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+for the tool capability matrix, local build commands and LEP100-15 status.
 
 ---
 

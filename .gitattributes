@@ -1,0 +1,4 @@
+*.sh text eol=lf
+sdk/tooling/bin/* text eol=lf
+*.rs text eol=lf
+*.md whitespace=-blank-at-eol

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use lithovm_bytecode::parse;
 use lithovm_receipts::ReceiptV1;
 use lithovm_zk_verifier::{StubVerifier, ZkVerifier};
@@ -10,7 +10,9 @@ pub struct Vm {
 
 impl Default for Vm {
     fn default() -> Self {
-        Self { verifier: Box::new(StubVerifier) }
+        Self {
+            verifier: Box::new(StubVerifier),
+        }
     }
 }
 
@@ -26,7 +28,14 @@ impl Vm {
         Ok(())
     }
 
-    pub fn verify_zk(&self, proof_system: &str, vk_id: &[u8], public_inputs: &[u8], proof: &[u8]) -> Result<bool> {
-        self.verifier.verify(proof_system, vk_id, public_inputs, proof)
+    pub fn verify_zk(
+        &self,
+        proof_system: &str,
+        vk_id: &[u8],
+        public_inputs: &[u8],
+        proof: &[u8],
+    ) -> Result<bool> {
+        self.verifier
+            .verify(proof_system, vk_id, public_inputs, proof)
     }
 }
