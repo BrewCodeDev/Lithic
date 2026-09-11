@@ -138,6 +138,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lithovm-lab"
+version = "0.1.0"
+
+[[package]]
 name = "lithovm-receipts"
 version = "0.1.0"
 dependencies = [

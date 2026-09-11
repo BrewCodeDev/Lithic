@@ -26,6 +26,10 @@ These commands build and test the scaffold. Passing the existing tests does not 
 
 ## Lithosphere integration
 
+A [local execution experiment](LITHOVM_EXECUTION_LAB.md) compiles and executes
+one constant-return subset using a distinct experimental format. It does not
+establish production LithoVM compatibility or change lithc's supported output.
+
 The tested front end from `KaJLabs/Lithosphere/toolchain` has been imported here. See [import provenance and command changes](FRONTEND_IMPORT.md). This does not establish executable bytecode generation.
 
 An EVM RPC on Lithosphere does not, by itself, demonstrate native LithoVM execution. Published integration instructions need an identified compiler target, exact runtime version, deployment interface and independently verified execution example. Lithic and Solidity support are separate from any policy requiring a particular language.
