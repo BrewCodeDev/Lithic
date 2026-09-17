@@ -31,9 +31,10 @@ bytecode, runtime bytecode, canonical signatures and four-byte selectors.
 Every compiled function must be:
 
 - `pub` and synchronous;
-- parameterless;
+- use only static `u64`, `u256`, `bool`, `address`, or `bytes32` parameters;
 - explicitly return `u64`, `u256`, `bool`, `address`, or `bytes32`;
-- contain exactly one constant return statement.
+- contain exactly one return statement whose value is a constant or a
+  same-typed parameter.
 
 Example:
 
@@ -43,16 +44,23 @@ contract ReleaseInfo {
         return 9005;
     }
 }
+
+contract Identity {
+    pub fn echo(value: u64) -> u64 {
+        return value;
+    }
+}
 ```
 
 The backend supports multiple functions and standard EVM selector dispatch.
-Unknown selectors and calldata shorter than four bytes revert.
+Unknown selectors, wrong calldata lengths, and non-canonical `u64`, `bool`, or
+`address` encodings revert.
 
 ## Fail-closed rules
 
 The complete compilation fails when source includes any unsupported semantic,
-including state fields, constants, private functions, parameters, async
-functions, attributes, expressions, calls, or unsupported types. It never
+including state fields, constants, private functions, dynamic parameters,
+async functions, attributes, expressions, calls, or unsupported types. It never
 emits partial bytecode after dropping source behavior.
 
 This release does not yet support storage, external calls, transfers, events,

@@ -1,9 +1,10 @@
 //! A fail-closed Lithic-to-EVM backend.
 //!
 //! The backend deliberately begins with a small, deployable subset: stateless
-//! public functions with no parameters that return a constant `u64`, `u256`,
-//! `bool`, `address`, or `bytes32`. Any unsupported declaration or function
-//! body rejects the whole contract instead of being ignored or miscompiled.
+//! public functions with static parameters that return a constant or one of
+//! their parameters as `u64`, `u256`, `bool`, `address`, or `bytes32`. Any
+//! unsupported declaration or function body rejects the whole contract instead
+//! of being ignored or miscompiled.
 
 use lithic_syntax::{Contract, Item, Type};
 use serde::Serialize;
@@ -66,7 +67,19 @@ struct CompiledFunction {
     artifact: FunctionArtifact,
     selector: [u8; 4],
     output_type: &'static str,
-    return_word: [u8; 32],
+    inputs: Vec<CompiledParam>,
+    return_value: ReturnValue,
+}
+
+struct CompiledParam {
+    name: String,
+    evm_type: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum ReturnValue {
+    Constant([u8; 32]),
+    Parameter(usize),
 }
 
 /// Compile a complete Lithic source file into an EVM deployment artifact.
@@ -163,17 +176,31 @@ fn compile_function(function: &lithic_syntax::FuncDecl) -> Result<CompiledFuncti
     if !function.attrs.is_empty() {
         return Err("function attributes are not supported by the v1 EVM backend".to_string());
     }
-    if !function.params.is_empty() {
-        return Err("function parameters are not supported by the v1 EVM backend".to_string());
-    }
-
     let return_type = function
         .ret
         .as_ref()
         .ok_or_else(|| "a return type is required".to_string())?;
     let output_type = evm_type(return_type)?;
-    let return_word = parse_constant_return(&function.body_src, output_type)?;
-    let signature = format!("{}()", function.name);
+    let inputs = function
+        .params
+        .iter()
+        .map(|param| {
+            Ok(CompiledParam {
+                name: param.name.clone(),
+                evm_type: evm_type(&param.ty)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let return_value = parse_return(&function.body_src, output_type, &inputs)?;
+    let signature = format!(
+        "{}({})",
+        function.name,
+        inputs
+            .iter()
+            .map(|param| param.evm_type)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let hash = Keccak256::digest(signature.as_bytes());
     let selector: [u8; 4] = hash[..4].try_into().expect("four-byte selector");
 
@@ -185,7 +212,8 @@ fn compile_function(function: &lithic_syntax::FuncDecl) -> Result<CompiledFuncti
         },
         selector,
         output_type,
-        return_word,
+        inputs,
+        return_value,
     })
 }
 
@@ -203,7 +231,11 @@ fn evm_type(ty: &Type) -> Result<&'static str, String> {
     }
 }
 
-fn parse_constant_return(body: &str, evm_type: &str) -> Result<[u8; 32], String> {
+fn parse_return(
+    body: &str,
+    output_type: &str,
+    inputs: &[CompiledParam],
+) -> Result<ReturnValue, String> {
     let body = body.trim();
     let value = body
         .strip_prefix("return")
@@ -212,11 +244,25 @@ fn parse_constant_return(body: &str, evm_type: &str) -> Result<[u8; 32], String>
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "expected exactly 'return <constant>;'".to_string())?;
 
+    if let Some((index, param)) = inputs
+        .iter()
+        .enumerate()
+        .find(|(_, param)| param.name == value)
+    {
+        if param.evm_type != output_type {
+            return Err(format!(
+                "return parameter '{}' has type {}, expected {}",
+                param.name, param.evm_type, output_type
+            ));
+        }
+        return Ok(ReturnValue::Parameter(index));
+    }
+
     if value.contains(char::is_whitespace) {
         return Err("constant return expression contains unsupported tokens".to_string());
     }
 
-    match evm_type {
+    let word = match output_type {
         "bool" => match value {
             "true" => Ok(word_from_u64(1)),
             "false" => Ok([0; 32]),
@@ -232,7 +278,8 @@ fn parse_constant_return(body: &str, evm_type: &str) -> Result<[u8; 32], String>
         }
         "uint256" => parse_u256_decimal(value),
         _ => Err("internal unsupported EVM type".to_string()),
-    }
+    }?;
+    Ok(ReturnValue::Constant(word))
 }
 
 fn parse_fixed_hex(value: &str, width: usize) -> Result<[u8; 32], String> {
@@ -274,7 +321,7 @@ fn word_from_u64(value: u64) -> [u8; 32] {
 }
 
 fn build_runtime(functions: &[CompiledFunction]) -> Result<Vec<u8>, CompileError> {
-    let mut code = vec![0x36, 0x60, 0x04, 0x10, 0x61, 0, 0, 0x57];
+    let mut code = vec![0x36, 0x60, 0x04, 0x11, 0x61, 0, 0, 0x57];
     let short_calldata_jump = 5;
     code.extend([0x60, 0x00, 0x35, 0x60, 0xe0, 0x1c]);
 
@@ -294,11 +341,69 @@ fn build_runtime(functions: &[CompiledFunction]) -> Result<Vec<u8>, CompileError
     for (function, patch) in functions.iter().zip(destinations) {
         let destination = u16_offset(code.len())?;
         patch_u16(&mut code, patch, destination);
-        code.extend([0x5b, 0x50, 0x7f]);
-        code.extend(function.return_word);
+        code.extend([0x5b, 0x50]);
+        let expected_calldata = 4usize
+            .checked_add(function.inputs.len() * 32)
+            .ok_or_else(|| CompileError::one("function calldata size overflow"))?;
+        let expected_calldata = u16::try_from(expected_calldata)
+            .map_err(|_| CompileError::one("function calldata exceeds v1 size limit"))?;
+        code.extend([
+            0x61,
+            (expected_calldata >> 8) as u8,
+            expected_calldata as u8,
+            0x36,
+            0x14,
+            0x61,
+        ]);
+        let valid_size_patch = code.len();
+        code.extend([0, 0, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd]);
+        let valid_size_destination = u16_offset(code.len())?;
+        patch_u16(&mut code, valid_size_patch, valid_size_destination);
+        code.push(0x5b);
+
+        for (index, input) in function.inputs.iter().enumerate() {
+            emit_parameter_load(&mut code, index)?;
+            emit_parameter_validation(&mut code, input.evm_type)?;
+            code.push(0x50);
+        }
+
+        match function.return_value {
+            ReturnValue::Constant(word) => {
+                code.push(0x7f);
+                code.extend(word);
+            }
+            ReturnValue::Parameter(index) => {
+                emit_parameter_load(&mut code, index)?;
+            }
+        }
         code.extend([0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
     }
     Ok(code)
+}
+
+fn emit_parameter_load(code: &mut Vec<u8>, index: usize) -> Result<(), CompileError> {
+    let offset = 4usize + index * 32;
+    let offset = u16::try_from(offset)
+        .map_err(|_| CompileError::one("parameter offset exceeds v1 limit"))?;
+    code.extend([0x61, (offset >> 8) as u8, offset as u8, 0x35]);
+    Ok(())
+}
+
+fn emit_parameter_validation(code: &mut Vec<u8>, evm_type: &str) -> Result<(), CompileError> {
+    match evm_type {
+        "uint256" | "bytes32" => return Ok(()),
+        "uint64" => code.extend([0x80, 0x60, 0x40, 0x1c, 0x15]),
+        "address" => code.extend([0x80, 0x60, 0xa0, 0x1c, 0x15]),
+        "bool" => code.extend([0x80, 0x60, 0x01, 0x10, 0x15]),
+        _ => return Err(CompileError::one("internal unsupported parameter type")),
+    }
+    code.push(0x61);
+    let valid_patch = code.len();
+    code.extend([0, 0, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd]);
+    let valid_destination = u16_offset(code.len())?;
+    patch_u16(code, valid_patch, valid_destination);
+    code.push(0x5b);
+    Ok(())
 }
 
 fn wrap_deployment(runtime: &[u8]) -> Result<Vec<u8>, CompileError> {
@@ -344,7 +449,10 @@ fn build_abi(functions: &[CompiledFunction]) -> serde_json::Value {
                     "type": "function",
                     "name": function.artifact.name,
                     "stateMutability": "pure",
-                    "inputs": [],
+                    "inputs": function.inputs.iter().map(|param| serde_json::json!({
+                        "name": param.name,
+                        "type": param.evm_type
+                    })).collect::<Vec<_>>(),
                     "outputs": [{"name": "", "type": function.output_type}]
                 })
             })
@@ -392,7 +500,7 @@ mod tests {
     fn rejects_every_unsupported_semantic_instead_of_dropping_it() {
         let cases = [
             "contract C { state { value: u64; } pub fn x() -> u64 { return 1; } }",
-            "contract C { pub fn x(value: u64) -> u64 { return 1; } }",
+            "contract C { pub fn x(value: string) -> u64 { return 1; } }",
             "contract C { pub async fn x() -> u64 { return 1; } }",
             "contract C { fn x() -> u64 { return 1; } }",
             "contract C { pub fn x() -> u64 { return 1 + 2; } }",
@@ -409,6 +517,28 @@ mod tests {
             "115792089237316195423570985008687907853269984665640564039457584007913129639936";
         let source = format!("contract C {{ pub fn x() -> u256 {{ return {overflow}; }} }}");
         assert!(compile(&source).is_err());
+    }
+
+    #[test]
+    fn compiles_static_parameters_into_selector_and_abi() {
+        let artifact = compile(
+            "contract C { pub fn echo(value: u64, enabled: bool) -> u64 { return value; } }",
+        )
+        .expect("compile");
+        assert_eq!(artifact.functions[0].signature, "echo(uint64,bool)");
+        assert_eq!(artifact.functions[0].selector, "0xcb6fb066");
+        assert_eq!(artifact.abi[0]["inputs"][0]["name"], "value");
+        assert_eq!(artifact.abi[0]["inputs"][0]["type"], "uint64");
+        assert_eq!(artifact.abi[0]["inputs"][1]["type"], "bool");
+    }
+
+    #[test]
+    fn rejects_parameter_return_type_mismatch() {
+        let error = compile("contract C { pub fn bad(value: address) -> u64 { return value; } }")
+            .expect_err("must reject mismatched parameter return");
+        assert!(error
+            .to_string()
+            .contains("has type address, expected uint64"));
     }
 
     #[test]
@@ -433,10 +563,116 @@ mod tests {
             .build();
 
         let result = evm.transact().expect("EVM transaction");
-        let output = result.result.output().expect("successful output");
+        assert!(
+            result.result.is_success(),
+            "execution failed: {:?}",
+            result.result
+        );
+        let output = result
+            .result
+            .output()
+            .unwrap_or_else(|| panic!("expected output: {:?}", result.result));
         assert_eq!(output.len(), 32);
         assert_eq!(&output[..24], &[0u8; 24]);
         assert_eq!(&output[24..], &42u64.to_be_bytes());
+    }
+
+    #[test]
+    fn decodes_and_validates_static_parameter_in_an_independent_evm() {
+        use revm::{
+            db::BenchmarkDB,
+            primitives::{address, Bytecode, Bytes, ExecutionResult, TxKind},
+            Evm,
+        };
+
+        let artifact = compile("contract C { pub fn echo(value: u64) -> u64 { return value; } }")
+            .expect("compile");
+        let runtime = hex::decode(&artifact.deployed_bytecode[2..]).expect("runtime hex");
+        let mut calldata = hex::decode(&artifact.functions[0].selector[2..]).expect("selector");
+        calldata.extend(word_from_u64(42));
+        let mut evm = Evm::builder()
+            .with_db(BenchmarkDB::new_bytecode(Bytecode::new_raw(
+                runtime.clone().into(),
+            )))
+            .modify_tx_env(|tx| {
+                tx.caller = address!("1000000000000000000000000000000000000000");
+                tx.transact_to = TxKind::Call(address!("0000000000000000000000000000000000000000"));
+                tx.data = Bytes::from(calldata);
+            })
+            .build();
+        let result = evm.transact().expect("EVM transaction");
+        assert!(
+            result.result.is_success(),
+            "execution failed: {:?}",
+            result.result
+        );
+        let output = result.result.output().expect("successful output");
+        assert_eq!(&output[24..], &42u64.to_be_bytes());
+
+        let mut malformed = hex::decode(&artifact.functions[0].selector[2..]).expect("selector");
+        let mut invalid_u64 = [0u8; 32];
+        invalid_u64[0] = 1;
+        malformed.extend(invalid_u64);
+        let mut evm = Evm::builder()
+            .with_db(BenchmarkDB::new_bytecode(Bytecode::new_raw(runtime.into())))
+            .modify_tx_env(|tx| {
+                tx.caller = address!("1000000000000000000000000000000000000000");
+                tx.transact_to = TxKind::Call(address!("0000000000000000000000000000000000000000"));
+                tx.data = Bytes::from(malformed);
+            })
+            .build();
+        let result = evm.transact().expect("EVM transaction");
+        assert!(matches!(result.result, ExecutionResult::Revert { .. }));
+    }
+
+    #[test]
+    fn rejects_non_exact_calldata_length() {
+        use revm::{
+            db::BenchmarkDB,
+            primitives::{address, Bytecode, Bytes, ExecutionResult, TxKind},
+            Evm,
+        };
+
+        let artifact =
+            compile("contract C { pub fn answer() -> u64 { return 42; } }").expect("compile");
+        let runtime = hex::decode(&artifact.deployed_bytecode[2..]).expect("runtime hex");
+        let mut calldata = hex::decode(&artifact.functions[0].selector[2..]).expect("selector");
+        calldata.push(0);
+        let mut evm = Evm::builder()
+            .with_db(BenchmarkDB::new_bytecode(Bytecode::new_raw(runtime.into())))
+            .modify_tx_env(|tx| {
+                tx.caller = address!("1000000000000000000000000000000000000000");
+                tx.transact_to = TxKind::Call(address!("0000000000000000000000000000000000000000"));
+                tx.data = Bytes::from(calldata);
+            })
+            .build();
+        let result = evm.transact().expect("EVM transaction");
+        assert!(matches!(result.result, ExecutionResult::Revert { .. }));
+    }
+
+    #[test]
+    fn validates_unused_static_parameters() {
+        use revm::{
+            db::BenchmarkDB,
+            primitives::{address, Bytecode, Bytes, ExecutionResult, TxKind},
+            Evm,
+        };
+
+        let artifact = compile("contract C { pub fn answer(enabled: bool) -> u64 { return 42; } }")
+            .expect("compile");
+        let runtime = hex::decode(&artifact.deployed_bytecode[2..]).expect("runtime hex");
+        let mut calldata = hex::decode(&artifact.functions[0].selector[2..]).expect("selector");
+        calldata.extend(word_from_u64(2));
+        let mut evm = Evm::builder()
+            .with_db(BenchmarkDB::new_bytecode(Bytecode::new_raw(runtime.into())))
+            .modify_tx_env(|tx| {
+                tx.caller = address!("1000000000000000000000000000000000000000");
+                tx.transact_to = TxKind::Call(address!("0000000000000000000000000000000000000000"));
+                tx.data = Bytes::from(calldata);
+            })
+            .build();
+        let result = evm.transact().expect("EVM transaction");
+        assert!(matches!(result.result, ExecutionResult::Revert { .. }));
     }
 
     #[test]

@@ -171,7 +171,8 @@ Contracts MUST explicitly declare sensitive privileges, enabling:
 ## Getting Started
 
 This repository contains a preview `lithc 0.2.0` EVM backend for a strict
-stateless subset. Read [EVM backend v1](docs/EVM_BACKEND_V1.md) and
+stateless subset with static ABI parameters. Read
+[EVM backend v1](docs/EVM_BACKEND_V1.md) and
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) for exact capabilities
 and LEP100-15 status. Native LithoVM, storage and LEP100-15 execution remain
 under development.

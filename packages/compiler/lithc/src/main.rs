@@ -22,7 +22,8 @@ EXAMPLES:
     lithc --emit check DOGE.lithic
     lithc --emit evm apps/examples/frontend/evm-constants.lithic
 
-EVM output supports stateless, no-argument public constant-return functions.
+EVM output supports stateless public functions returning a constant or a
+same-typed static parameter.
 Unsupported semantics reject the complete build."#,
         env!("CARGO_PKG_VERSION")
     );

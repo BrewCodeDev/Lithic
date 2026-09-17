@@ -4,7 +4,7 @@ This repository contains a preview compiler backend plus development scaffolds. 
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses/checks declarations and emits ABI plus executable EVM deployment/runtime bytecode for the documented stateless constant-return subset. Unsupported semantics fail the complete build. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM deployment/runtime bytecode for the documented stateless subset with static ABI parameters and constant or identity returns. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |
