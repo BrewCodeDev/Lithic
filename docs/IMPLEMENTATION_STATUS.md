@@ -1,16 +1,16 @@
 # Lithic implementation status
 
-This repository is a development scaffold. Its design documents describe intended capabilities; they do not establish production availability or mainnet support.
+This repository contains a preview compiler backend plus development scaffolds. Its design documents describe intended capabilities; they do not establish production availability.
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses declarations and emits summary, AST, declaration ABI or conservative checks. No executable bytecode. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM deployment/runtime bytecode for the documented stateless constant-return subset. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |
 | lithls, lithtest, lithsec, lithpkg | Specification-only targets. No usable implementations here. |
 
-The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The VM scaffold has no contract execution implementation; receipt and zk verification placeholders must not be used to authorize anything.
+The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM scaffold has no separate contract execution implementation; receipt and zk verification placeholders must not be used to authorize anything. The current executable target is documented in [EVM backend v1](EVM_BACKEND_V1.md).
 
 ## Local development
 
@@ -22,17 +22,17 @@ cargo test --workspace
 cargo run -p lithc -- --help
 ```
 
-These commands build and test the scaffold. Passing the existing tests does not establish language conformance, secure verification or deployable bytecode. No production installation or deployment command is available here.
+These commands build and test the toolchain. Passing them validates only the capability matrix above. No production installation, signing or deployment command is included.
 
 ## Lithosphere integration
 
-A [local execution experiment](LITHOVM_EXECUTION_LAB.md) compiles and executes
-one constant-return subset using a distinct experimental format. It does not
-establish production LithoVM compatibility or change lithc's supported output.
+A [local execution experiment](LITHOVM_EXECUTION_LAB.md) remains historical.
+The supported `lithc` output for the initial release is EVM bytecode described
+in [EVM backend v1](EVM_BACKEND_V1.md).
 
-The tested front end from `KaJLabs/Lithosphere/toolchain` has been imported here. See [import provenance and command changes](FRONTEND_IMPORT.md). This does not establish executable bytecode generation.
+The tested front end from `KaJLabs/Lithosphere/toolchain` has been imported here. See [import provenance and command changes](FRONTEND_IMPORT.md).
 
-An EVM RPC on Lithosphere does not, by itself, demonstrate native LithoVM execution. Published integration instructions need an identified compiler target, exact runtime version, deployment interface and independently verified execution example. Lithic and Solidity support are separate from any policy requiring a particular language.
+The initial backend explicitly targets the deployed EVM interface on LITHO. It does not claim that a separate native LithoVM module or `lithic_*` RPC namespace exists.
 
 ## LEP100-15
 

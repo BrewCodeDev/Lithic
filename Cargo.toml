@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "packages/vm/lithovm-lab",
+  "packages/compiler/lithic-evm",
   "packages/compiler/lithic-syntax",
   "packages/compiler/lithc",
   "packages/compiler/lithfmt",

@@ -1,31 +1,29 @@
 //! `lithc` — the Lithic compiler.
 //!
-//! This scaffold implements the compiler front-end: it lexes and parses a
-//! `.lithic` source file, reports diagnostics, and emits either a human
-//! summary, the declaration AST as JSON, or a Lithic ABI as JSON. It performs
-//! conservative declaration checks, while full type checking and LithoVM
-//! bytecode codegen remain future phases (see README).
+//! The command exposes declaration checks and a fail-closed EVM backend for
+//! the currently supported stateless language subset.
 
 use std::process::exit;
 
 fn print_help() {
     eprintln!(
-        "lithc {} — Lithic compiler (front-end scaffold)\n\
-\n\
-USAGE:\n\
-    lithc [OPTIONS] <FILE.lithic>\n\
-\n\
-OPTIONS:\n\
-    --emit <KIND>   Output kind: summary (default), ast, abi, check\n\
-    -h, --help      Print this help\n\
-\n\
-EXAMPLES:\n\
-    lithc Makalu/contracts/src/DOGE.lithic\n\
-    lithc --emit abi DOGE.lithic\n\
-    lithc --emit check DOGE.lithic\n\
-\n\
-NOTE: check validates parsing and unambiguous declaration-name collisions.\n\
-Full type checking and LithoVM bytecode emission are not yet implemented.",
+        r#"lithc {} — Lithic compiler
+
+USAGE:
+    lithc [OPTIONS] <FILE.lithic>
+
+OPTIONS:
+    --emit <KIND>   summary (default), ast, abi, check, evm, bytecode, runtime
+    -h, --help      Print this help
+
+EXAMPLES:
+    lithc Makalu/contracts/src/DOGE.lithic
+    lithc --emit abi DOGE.lithic
+    lithc --emit check DOGE.lithic
+    lithc --emit evm apps/examples/frontend/evm-constants.lithic
+
+EVM output supports stateless, no-argument public constant-return functions.
+Unsupported semantics reject the complete build."#,
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -77,13 +75,17 @@ fn main() {
         }
     };
 
+    if matches!(emit.as_str(), "evm" | "bytecode" | "runtime") {
+        emit_evm(&src, &emit);
+        return;
+    }
+
     let res = lithic_syntax::parse(&src);
     for d in &res.diagnostics {
         eprintln!("{}", d.render(&src, &path));
     }
 
     let errors = res.error_count();
-
     let contract = match res.contract {
         Some(c) => c,
         None => {
@@ -117,10 +119,27 @@ fn main() {
         "abi" => println!("{}", contract.to_abi_json()),
         other => {
             eprintln!(
-                "lithc: error: unknown emit kind '{}' (expected summary|ast|abi|check)",
+                "lithc: error: unknown emit kind '{}' (expected summary|ast|abi|check|evm|bytecode|runtime)",
                 other
             );
             exit(2);
+        }
+    }
+}
+
+fn emit_evm(source: &str, emit: &str) {
+    match lithic_evm::compile(source) {
+        Ok(artifact) => match emit {
+            "evm" => println!("{}", artifact.to_json()),
+            "bytecode" => println!("{}", artifact.bytecode),
+            "runtime" => println!("{}", artifact.deployed_bytecode),
+            _ => unreachable!(),
+        },
+        Err(error) => {
+            for message in error.messages() {
+                eprintln!("lithc: error: {message}");
+            }
+            exit(1);
         }
     }
 }

@@ -15,27 +15,29 @@ destination workspace's 0.1.0 convention; this does not publish a release.
 
 ## Command transition
 
-The old `lithc compile` command emitted a dummy source-hash container. It is
+The old `lithc compile` command emitted a dummy source-hash container. It was
 replaced by the tested front end, which offers summary, AST, declaration ABI
-and conservative declaration checks. There is no bytecode output mode.
+and conservative declaration checks. `lithc 0.2.0` subsequently added the
+fail-closed output modes documented in [EVM backend v1](EVM_BACKEND_V1.md).
 
 ```sh
 cargo run -p lithc -- --emit check apps/examples/frontend/hello.lithic
 cargo run -p lithc -- --emit ast apps/examples/frontend/hello.lithic
+cargo run -p lithc -- --emit evm apps/examples/frontend/evm-constants.lithic
 cargo run -p lithfmt -- --check apps/examples/frontend/hello.lithic
 cargo run -p lithlint -- --deny-warnings apps/examples/frontend/hello.lithic
 ```
 
-`check` does not type-check or execute function bodies. Declaration ABI is
-descriptive output, not an approved runtime ABI. Existing draft syntax such as
-LEP100-15 is not yet supported. Formatter and linter retain their bounded
-whitespace/declaration behavior. VM packages remain separate scaffolds.
+`check` does not type-check or execute function bodies. The EVM backend applies
+its own strict body/type validation and rejects anything outside its documented
+subset. Existing draft syntax such as LEP100-15 is not yet supported. Formatter
+and linter retain their bounded whitespace/declaration behavior. Native VM
+packages remain separate scaffolds.
 
 ## Next boundary
 
-Before executable compilation, specify LithoVM bytecode and versioning,
-instruction semantics, gas, storage, calls, rollback, deployment format and
-host APIs. Implement body parsing and type checking, then code generation
-and execution tests against that interface. The public VM scaffold currently
-does not execute contract instructions; do not infer a production runtime
-from its name or its permissive verification placeholders.
+The first executable target uses the deployed EVM interface. Expanding it
+requires typed body parsing, storage/call lowering and rollback tests. A
+separate native LithoVM still requires bytecode/versioning, instruction, gas,
+storage, call, rollback, deployment and host-interface specifications. The
+public native VM scaffold does not execute contract instructions.

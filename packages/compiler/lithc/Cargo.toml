@@ -1,13 +1,14 @@
 [package]
 name = "lithc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "lithc — the Lithic compiler (front-end scaffold: parse, check, emit ABI/AST)."
+description = "lithc — Lithic frontend and fail-closed EVM artifact compiler."
 
 [[bin]]
 name = "lithc"
 path = "src/main.rs"
 
 [dependencies]
+lithic-evm = { path = "../lithic-evm" }
 lithic-syntax = { path = "../lithic-syntax" }

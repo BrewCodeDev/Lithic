@@ -16,8 +16,8 @@ cargo test --locked -p lithovm-lab
 
 Expected result: `return=42; gas_used=1; production_compatible=false`.
 The CLI compiles and runs in memory; it has no RPC, deployment or signing path.
-The ordinary lithc CLI remains a declaration front end. This experiment does
-not enable bytecode output in lithc or make the LEP100-15 examples executable.
+This experiment predates and is separate from the executable EVM backend in
+[EVM backend v1](EVM_BACKEND_V1.md). It does not make LEP100-15 executable.
 
 ## Deliberately narrow local contract
 
