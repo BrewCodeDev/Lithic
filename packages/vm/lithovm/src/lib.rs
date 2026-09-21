@@ -16,6 +16,13 @@ pub struct ExecutionResult {
     pub return_type: ValueType,
     pub return_value: [u8; 32],
     pub gas_used: u64,
+    pub events: Vec<EventRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventRecord {
+    pub name: String,
+    pub fields: Vec<(String, ValueType, [u8; 32])>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -210,8 +217,10 @@ fn execute_program(
     }
     let mut environment = RuntimeEnvironment {
         storage_fields: &program.storage,
+        event_definitions: &program.events,
         storage,
         context,
+        events: Vec::new(),
     };
     let return_value = match &function.return_value {
         ReturnValue::Constant(word) => word,
@@ -242,6 +251,7 @@ fn execute_program(
         return_type: function.return_type,
         return_value: *return_value,
         gas_used,
+        events: environment.events,
     })
 }
 
@@ -274,8 +284,10 @@ struct StackValue {
 
 struct RuntimeEnvironment<'a> {
     storage_fields: &'a [lithovm_bytecode::StorageField],
+    event_definitions: &'a [lithovm_bytecode::EventDefinition],
     storage: &'a mut Storage,
     context: Option<&'a ExecutionContext>,
+    events: Vec<EventRecord>,
 }
 
 fn execute_expression(
@@ -295,6 +307,7 @@ fn execute_expression(
         return_type,
         return_value: result.word,
         gas_used,
+        events: Vec::new(),
     })
 }
 
@@ -478,6 +491,7 @@ fn execute_statements(
         return_type,
         return_value: result.word,
         gas_used: meter.used,
+        events: std::mem::take(&mut environment.events),
     })
 }
 
@@ -540,6 +554,31 @@ fn execute_block(
                     .storage
                     .values
                     .insert(field.name.clone(), value.word);
+            }
+            Statement::Emit { event, values } => {
+                let definition = environment
+                    .event_definitions
+                    .get(*event as usize)
+                    .ok_or_else(|| anyhow!("runtime event index is out of range"))?;
+                let mut fields = Vec::with_capacity(values.len());
+                for (expression, field) in values.iter().zip(&definition.fields) {
+                    meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
+                    let value = evaluate_expression(
+                        expression,
+                        arguments,
+                        parameter_types,
+                        locals,
+                        environment,
+                    )?;
+                    if value.value_type != field.value_type {
+                        bail!("event field runtime type mismatch");
+                    }
+                    fields.push((field.name.clone(), field.value_type, value.word));
+                }
+                environment.events.push(EventRecord {
+                    name: definition.name.clone(),
+                    fields,
+                });
             }
             Statement::If {
                 condition,
@@ -642,6 +681,7 @@ mod tests {
     fn executes_constant_and_identity_functions() {
         let bytes = Program {
             storage: vec![],
+            events: vec![],
             functions: vec![
                 Function {
                     name: "answer".into(),
@@ -683,6 +723,7 @@ mod tests {
     fn rejects_bad_calls_before_execution() {
         let bytes = Program {
             storage: vec![],
+            events: vec![],
             functions: vec![Function {
                 name: "echo".into(),
                 parameters: vec![ValueType::Bool],
@@ -703,6 +744,7 @@ mod tests {
     fn executes_checked_typed_expressions() {
         let bytes = Program {
             storage: vec![],
+            events: vec![],
             functions: vec![Function {
                 name: "increment".into(),
                 parameters: vec![ValueType::U64],

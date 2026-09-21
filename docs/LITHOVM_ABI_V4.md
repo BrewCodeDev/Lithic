@@ -2,6 +2,9 @@
 
 Status: implementation candidate; explicit deterministic host context
 
+Superseded for new compiler output by version 5. Runtime decoding remains
+supported.
+
 Target identifier: `lithovm-native-v4`
 
 Version 4 extends version 3 with typed message, block and chain context. The

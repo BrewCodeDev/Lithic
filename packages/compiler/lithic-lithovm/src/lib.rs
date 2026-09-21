@@ -6,13 +6,13 @@
 
 use lithic_syntax::{Contract, Item, Type};
 use lithovm_bytecode::{
-    Function, Instruction, Program, ReturnValue, Statement, StorageField, ValueType,
-    MAX_BLOCK_DEPTH, MAX_LOCALS, MAX_STATEMENTS, VERSION,
+    EventDefinition, Function, Instruction, Program, ReturnValue, Statement, StorageField,
+    ValueType, MAX_BLOCK_DEPTH, MAX_LOCALS, MAX_STATEMENTS, VERSION,
 };
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v4";
+pub const TARGET: &str = "lithovm-native-v5";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +83,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     let mut functions = Vec::new();
     let mut abi = Vec::new();
     let mut storage = Vec::new();
+    let mut events = Vec::new();
 
     for item in &contract.items {
         if let Item::State(state) = item {
@@ -99,14 +100,41 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     }
 
     for item in &contract.items {
+        if let Item::Event(event) = item {
+            let mut fields = Vec::new();
+            for field in &event.fields {
+                match lower_type(&field.ty) {
+                    Ok(value_type) => fields.push(StorageField {
+                        name: field.name.clone(),
+                        value_type,
+                    }),
+                    Err(message) => errors.push(format!(
+                        "event '{}' field '{}': {message}",
+                        event.name, field.name
+                    )),
+                }
+            }
+            events.push(EventDefinition {
+                name: event.name.clone(),
+                fields,
+            });
+            abi.push(serde_json::json!({
+                "type": "event",
+                "name": event.name,
+                "inputs": event.fields.iter().filter_map(|field| lower_type(&field.ty).ok().map(|value_type| {
+                    serde_json::json!({"name": field.name, "type": value_type.name()})
+                })).collect::<Vec<_>>()
+            }));
+        }
+    }
+
+    for item in &contract.items {
         match item {
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v4".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v5".to_string(),
             ),
-            Item::Event(_) => errors.push(
-                "event declarations are not supported by native LithoVM bytecode v4".to_string(),
-            ),
-            Item::Func(function) => match compile_function(function, &storage) {
+            Item::Event(_) => {}
+            Item::Func(function) => match compile_function(function, &storage, &events) {
                 Ok((compiled, entry)) => {
                     functions.push(compiled);
                     abi.push(entry);
@@ -123,7 +151,11 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
         return Err(CompileError { messages: errors });
     }
 
-    let program = Program { storage, functions };
+    let program = Program {
+        storage,
+        events,
+        functions,
+    };
     let bytes = program
         .encode()
         .map_err(|error| CompileError::one(format!("bytecode encoding failed: {error}")))?;
@@ -139,6 +171,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
 fn compile_function(
     function: &lithic_syntax::FuncDecl,
     storage: &[StorageField],
+    events: &[EventDefinition],
 ) -> Result<(Function, serde_json::Value), String> {
     if !function.is_pub {
         return Err("private functions are unsupported".to_string());
@@ -160,7 +193,7 @@ fn compile_function(
         .iter()
         .map(|parameter| lower_type(&parameter.ty))
         .collect::<Result<Vec<_>, _>>()?;
-    let return_value = parse_body(function, return_type, &parameters, storage)?;
+    let return_value = parse_body(function, return_type, &parameters, storage, events)?;
     let abi = serde_json::json!({
         "type": "function",
         "name": function.name,
@@ -188,7 +221,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v4 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v5 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -201,7 +234,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v4 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v5 lowering")),
     }
 }
 
@@ -210,10 +243,12 @@ fn parse_body(
     return_type: ValueType,
     parameter_types: &[ValueType],
     storage: &[StorageField],
+    events: &[EventDefinition],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
     if !starts_with_keyword(body, "let")
         && !starts_with_keyword(body, "if")
+        && !starts_with_keyword(body, "emit")
         && !body.starts_with("self.")
     {
         return parse_return(function, return_type, parameter_types, storage);
@@ -231,6 +266,7 @@ fn parse_body(
         local_names: Vec::new(),
         local_types: Vec::new(),
         storage,
+        events,
         statement_count: 0,
         return_type,
     };
@@ -253,6 +289,7 @@ struct BodyParser<'a> {
     local_names: Vec<String>,
     local_types: Vec<ValueType>,
     storage: &'a [StorageField],
+    events: &'a [EventDefinition],
     statement_count: usize,
     return_type: ValueType,
 }
@@ -296,6 +333,8 @@ impl BodyParser<'_> {
             } else if self.consume_keyword("if") {
                 terminal = true;
                 self.parse_if(depth)?
+            } else if self.consume_keyword("emit") {
+                self.parse_emit()?
             } else if self.consume_self_prefix() {
                 self.parse_store()?
             } else {
@@ -383,6 +422,64 @@ impl BodyParser<'_> {
         Ok(Statement::Store {
             field: field as u16,
             expression,
+        })
+    }
+
+    fn parse_emit(&mut self) -> Result<Statement, String> {
+        let event_name = self.parse_identifier()?;
+        let event = self
+            .events
+            .iter()
+            .position(|candidate| candidate.name == event_name)
+            .ok_or_else(|| format!("unknown event '{event_name}'"))?;
+        self.skip_whitespace();
+        self.expect_byte(b'{', "expected '{' after event name")?;
+        let definition = &self.events[event];
+        let mut values = Vec::with_capacity(definition.fields.len());
+        if definition.fields.is_empty() {
+            self.skip_whitespace();
+            self.expect_byte(b'}', "expected '}' after empty event")?;
+            self.skip_whitespace();
+            self.consume_byte(b';');
+            return Ok(Statement::Emit {
+                event: event as u16,
+                values,
+            });
+        }
+        for (index, field) in definition.fields.iter().enumerate() {
+            self.skip_whitespace();
+            let supplied_name = self.parse_identifier()?;
+            if supplied_name != field.name {
+                return Err(format!(
+                    "event '{event_name}' expected field '{}', found '{supplied_name}'",
+                    field.name
+                ));
+            }
+            self.skip_whitespace();
+            self.expect_byte(b':', "expected ':' after event field name")?;
+            let terminator = if index + 1 == definition.fields.len() {
+                b'}'
+            } else {
+                b','
+            };
+            let expression_source = self.take_expression_until(terminator)?.to_owned();
+            let (expression, expression_type) = self.compile_expression(&expression_source)?;
+            if expression_type != field.value_type {
+                return Err(format!(
+                    "event '{}' field '{}' has type {}, expression has type {}",
+                    event_name,
+                    field.name,
+                    field.value_type.name(),
+                    expression_type.name()
+                ));
+            }
+            values.push(expression);
+        }
+        self.skip_whitespace();
+        self.consume_byte(b';');
+        Ok(Statement::Emit {
+            event: event as u16,
+            values,
         })
     }
 
@@ -997,7 +1094,7 @@ mod tests {
         assert_eq!(compile(source).unwrap(), compile(source).unwrap());
         for unsupported in [
             "contract C { state { values: map<address, u64>; } pub fn x() -> u64 { return 1; } }",
-            "contract C { event Seen { value: u64 } pub fn x() -> u64 { return 1; } }",
+            "contract C { event Seen { values: map<address, u64> } pub fn x() -> u64 { return 1; } }",
             "contract C { pub fn x() -> u64 { return call(); } }",
             "contract C { pub async fn x() -> u64 { return 1; } }",
         ] {
@@ -1083,8 +1180,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v4");
-        assert_eq!(artifact.bytecode_version, 4);
+        assert_eq!(artifact.target, "lithovm-native-v5");
+        assert_eq!(artifact.bytecode_version, 5);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1281,5 +1378,50 @@ mod tests {
             word_from_u64(1234)
         );
         assert_eq!(storage.get("last"), Some(&word_from_u64(1234)));
+    }
+
+    #[test]
+    fn typed_events_are_emitted_in_order_after_success() {
+        let artifact = compile(
+            "contract Emitter { event Changed { account: address, value: u64 } pub fn change(account: address, value: u64) -> u64 { emit Changed { account: account, value: value }; return value; } }",
+        )
+        .unwrap();
+        assert_eq!(artifact.abi[0]["type"], "event");
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let mut account = [0; 32];
+        account[12..].copy_from_slice(&[9; 20]);
+        let result = Vm::default()
+            .execute(&bytes, "change", &[account, word_from_u64(42)], 100)
+            .unwrap();
+
+        assert_eq!(result.return_value, word_from_u64(42));
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].name, "Changed");
+        assert_eq!(result.events[0].fields[0].0, "account");
+        assert_eq!(result.events[0].fields[0].2, account);
+        assert_eq!(result.events[0].fields[1].2, word_from_u64(42));
+    }
+
+    #[test]
+    fn event_schema_and_emissions_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { event Seen { value: u64 } pub fn x() -> u64 { emit Missing { value: 1 }; return 1; } }",
+                "unknown event 'Missing'",
+            ),
+            (
+                "contract C { event Seen { value: u64 } pub fn x() -> u64 { emit Seen { value: true }; return 1; } }",
+                "field 'value' has type u64",
+            ),
+            (
+                "contract C { event Seen { value: u64, account: address } pub fn x() -> u64 { emit Seen { account: 0x0000000000000000000000000000000000000000, value: 1 }; return 1; } }",
+                "expected field 'value'",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
     }
 }
