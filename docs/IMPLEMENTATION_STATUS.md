@@ -4,13 +4,13 @@ This repository contains a preview compiler backend plus development scaffolds. 
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented subset. Native v7 output supports staged outbound contract-call intents and native transfers, typed events, explicit message/block/chain context, transactional scalar storage, static parameters, immutable locals, structured `if`/`else`, checked `u64` arithmetic and comparisons. Unsupported semantics fail the complete build. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented subset. Native v8 output supports typed mutable and immutable locals, staged outbound contract-call intents and native transfers, typed events, explicit message/block/chain context, transactional scalar storage, static parameters, structured `if`/`else`, checked `u64` arithmetic and comparisons. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |
 | lithls, lithtest, lithsec, lithpkg | Specification-only targets. No usable implementations here. |
 
-The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes [Native LithoVM ABI v7](LITHOVM_ABI_V7.md) and versions 1 through 6. Version 7 adds balance- and depth-checked staged outbound contract-call intents. Version 6 adds balance-checked staged native transfers. Version 5 adds typed deterministic event emission. Version 4 adds explicit `msg.sender`, `msg.value`, `block.height`, `block.timestamp` and `chain.id` inputs. Version 3 adds typed scalar storage with atomic commit and rollback. Synchronous calls, return data, mutable locals, loops, collection storage, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
+The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes [Native LithoVM ABI v8](LITHOVM_ABI_V8.md) and versions 1 through 7. Version 8 adds typed mutable local bindings and assignment. Version 7 adds balance- and depth-checked staged outbound contract-call intents. Version 6 adds balance-checked staged native transfers. Version 5 adds typed deterministic event emission. Version 4 adds explicit `msg.sender`, `msg.value`, `block.height`, `block.timestamp` and `chain.id` inputs. Version 3 adds typed scalar storage with atomic commit and rollback. Synchronous calls, return data, loops, collection storage, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
 
 ## Local development
 
@@ -28,7 +28,7 @@ These commands build and test the toolchain. Passing them validates only the cap
 
 A [local execution experiment](LITHOVM_EXECUTION_LAB.md) remains historical.
 `lithc --emit lithovm` now emits the versioned native artifact described in
-[Native LithoVM ABI v7](LITHOVM_ABI_V7.md), while retaining v1 through v6 decoding compatibility. This establishes the combined
+[Native LithoVM ABI v8](LITHOVM_ABI_V8.md), while retaining v1 through v7 decoding compatibility. This establishes the combined
 compiler/runtime boundary; it does not yet establish production readiness.
 
 The tested front end from `KaJLabs/Lithosphere/toolchain` has been imported here. See [import provenance and command changes](FRONTEND_IMPORT.md).

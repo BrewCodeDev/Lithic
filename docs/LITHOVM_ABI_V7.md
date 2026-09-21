@@ -2,6 +2,9 @@
 
 Status: implementation candidate; staged outbound contract-call intents
 
+Superseded for new compiler output by version 8. Runtime decoding remains
+supported.
+
 Target identifier: `lithovm-native-v7`
 
 Version 7 extends version 6 with a typed contract-call statement. The decoder

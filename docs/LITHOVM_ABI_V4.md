@@ -2,7 +2,7 @@
 
 Status: implementation candidate; explicit deterministic host context
 
-Superseded for new compiler output by version 7. Runtime decoding remains
+Superseded for new compiler output by version 8. Runtime decoding remains
 supported.
 
 Target identifier: `lithovm-native-v4`

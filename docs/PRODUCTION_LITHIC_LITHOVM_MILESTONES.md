@@ -18,9 +18,12 @@ Status: implemented in candidate
 
 ## M2 — Typed executable core
 
+Status: typed expressions, immutable and mutable locals, and structured branches implemented through version 8
+
 - typed expression AST/IR (checked `u64` arithmetic and comparisons implemented in candidate);
 - immutable local bindings and structured `if`/`else` implemented in the version 2 candidate;
-- remaining mutable bindings, loops and bounded recursion policy;
+- mutable local bindings and typed assignment implemented in the version 8 candidate;
+- remaining loops and bounded recursion policy;
 - overflow, division, recursion and resource limits;
 - compiler/runtime differential and fuzz tests.
 

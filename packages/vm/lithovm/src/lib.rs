@@ -548,6 +548,10 @@ fn execute_block(
             Statement::Let {
                 value_type,
                 expression,
+            }
+            | Statement::LetMutable {
+                value_type,
+                expression,
             } => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
                 let value = evaluate_expression(
@@ -561,6 +565,23 @@ fn execute_block(
                     bail!("local binding runtime type mismatch");
                 }
                 locals.push(value);
+            }
+            Statement::SetLocal { local, expression } => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
+                let value = evaluate_expression(
+                    expression,
+                    arguments,
+                    parameter_types,
+                    locals,
+                    environment,
+                )?;
+                let binding = locals
+                    .get_mut(*local as usize)
+                    .ok_or_else(|| anyhow!("runtime local assignment index is out of range"))?;
+                if binding.value_type != value.value_type {
+                    bail!("local assignment runtime type mismatch");
+                }
+                *binding = value;
             }
             Statement::Return(expression) => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;

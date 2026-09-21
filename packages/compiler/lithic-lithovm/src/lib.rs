@@ -12,7 +12,7 @@ use lithovm_bytecode::{
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v7";
+pub const TARGET: &str = "lithovm-native-v8";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,7 +131,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     for item in &contract.items {
         match item {
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v7".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v8".to_string(),
             ),
             Item::Event(_) => {}
             Item::Func(function) => match compile_function(function, &storage, &events) {
@@ -221,7 +221,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v7 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v8 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -234,7 +234,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v7 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v8 lowering")),
     }
 }
 
@@ -246,13 +246,7 @@ fn parse_body(
     events: &[EventDefinition],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
-    if !starts_with_keyword(body, "let")
-        && !starts_with_keyword(body, "if")
-        && !starts_with_keyword(body, "emit")
-        && !body.starts_with("transfer_native(")
-        && !body.starts_with("call_contract(")
-        && !body.starts_with("self.")
-    {
+    if starts_with_keyword(body, "return") {
         return parse_return(function, return_type, parameter_types, storage);
     }
     let parameter_names = function
@@ -267,6 +261,7 @@ fn parse_body(
         parameter_types,
         local_names: Vec::new(),
         local_types: Vec::new(),
+        local_mutability: Vec::new(),
         storage,
         events,
         statement_count: 0,
@@ -290,6 +285,7 @@ struct BodyParser<'a> {
     parameter_types: &'a [ValueType],
     local_names: Vec<String>,
     local_types: Vec<ValueType>,
+    local_mutability: Vec<bool>,
     storage: &'a [StorageField],
     events: &'a [EventDefinition],
     statement_count: usize,
@@ -344,7 +340,7 @@ impl BodyParser<'_> {
             } else if self.consume_self_prefix() {
                 self.parse_store()?
             } else {
-                return Err(format!("unsupported statement near '{}'", self.preview()));
+                self.parse_local_assignment()?
             };
             self.statement_count += 1;
             if self.statement_count > MAX_STATEMENTS {
@@ -356,9 +352,7 @@ impl BodyParser<'_> {
 
     fn parse_let(&mut self) -> Result<Statement, String> {
         self.skip_whitespace();
-        if self.consume_keyword("mut") {
-            return Err("mutable local bindings are not supported yet".to_string());
-        }
+        let mutable = self.consume_keyword("mut");
         let name = self.parse_identifier()?;
         if self.parameter_names.contains(&name.as_str()) || self.local_names.contains(&name) {
             return Err(format!("duplicate local binding '{name}'"));
@@ -387,8 +381,49 @@ impl BodyParser<'_> {
         }
         self.local_names.push(name);
         self.local_types.push(value_type);
-        Ok(Statement::Let {
-            value_type,
+        self.local_mutability.push(mutable);
+        if mutable {
+            Ok(Statement::LetMutable {
+                value_type,
+                expression,
+            })
+        } else {
+            Ok(Statement::Let {
+                value_type,
+                expression,
+            })
+        }
+    }
+
+    fn parse_local_assignment(&mut self) -> Result<Statement, String> {
+        let name = self.parse_identifier()?;
+        let Some(local) = self
+            .local_names
+            .iter()
+            .position(|candidate| candidate == &name)
+        else {
+            if self.parameter_names.contains(&name.as_str()) {
+                return Err(format!("parameter '{name}' is immutable"));
+            }
+            return Err(format!("unknown local binding '{name}'"));
+        };
+        if !self.local_mutability[local] {
+            return Err(format!("local binding '{name}' is immutable"));
+        }
+        self.skip_whitespace();
+        self.expect_byte(b'=', "expected '=' in local assignment")?;
+        let expression_source = self.take_expression_until(b';')?.to_owned();
+        let (expression, expression_type) = self.compile_expression(&expression_source)?;
+        let value_type = self.local_types[local];
+        if expression_type != value_type {
+            return Err(format!(
+                "local binding '{name}' has type {}, expression has type {}",
+                value_type.name(),
+                expression_type.name()
+            ));
+        }
+        Ok(Statement::SetLocal {
+            local: local as u16,
             expression,
         })
     }
@@ -563,6 +598,7 @@ impl BodyParser<'_> {
         let then_branch = self.parse_block(true, depth + 1)?;
         self.local_names.truncate(inherited_local_count);
         self.local_types.truncate(inherited_local_count);
+        self.local_mutability.truncate(inherited_local_count);
 
         self.skip_whitespace();
         if !self.consume_keyword("else") {
@@ -573,6 +609,7 @@ impl BodyParser<'_> {
         let else_branch = self.parse_block(true, depth + 1)?;
         self.local_names.truncate(inherited_local_count);
         self.local_types.truncate(inherited_local_count);
+        self.local_mutability.truncate(inherited_local_count);
         Ok(Statement::If {
             condition,
             then_branch,
@@ -686,11 +723,6 @@ impl BodyParser<'_> {
 
     fn peek_byte(&self) -> Option<u8> {
         self.source.as_bytes().get(self.position).copied()
-    }
-
-    fn preview(&self) -> &str {
-        let end = self.source.len().min(self.position + 24);
-        &self.source[self.position..end]
     }
 }
 
@@ -1126,6 +1158,12 @@ mod tests {
     use super::*;
     use lithovm::{ExecutionContext, Storage, Vm, BASE_CALL_GAS, PARAMETER_GAS};
 
+    fn word_from_bool(value: bool) -> [u8; 32] {
+        let mut word = [0; 32];
+        word[31] = u8::from(value);
+        word
+    }
+
     #[test]
     fn compiler_and_native_runtime_execute_the_same_artifact() {
         let artifact = compile(
@@ -1246,8 +1284,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v7");
-        assert_eq!(artifact.bytecode_version, 7);
+        assert_eq!(artifact.target, "lithovm-native-v8");
+        assert_eq!(artifact.bytecode_version, 8);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1302,10 +1340,6 @@ mod tests {
             (
                 "contract C { pub fn x(value: u64) -> u64 { if value { return 1; } else { return 2; } } }",
                 "if condition has type u64",
-            ),
-            (
-                "contract C { pub fn x(value: u64) -> u64 { let mut next = value; return next; } }",
-                "mutable local bindings",
             ),
         ] {
             assert!(
@@ -1679,6 +1713,57 @@ mod tests {
             (
                 "contract C { pub fn x(target: address, selector: bytes32, value: u64) -> u64 { call_contract(target, selector, value); return value; } }",
                 "value has type u64",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_locals_execute_with_checked_assignment() {
+        let artifact = compile(
+            "contract Counter { pub fn increment(value: u64, enabled: bool) -> u64 { let mut current: u64 = value; if enabled { current = current + 1; return current; } else { return current; } } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        let enabled = vm
+            .execute(
+                &bytes,
+                "increment",
+                &[word_from_u64(41), word_from_bool(true)],
+                200,
+            )
+            .unwrap();
+        assert_eq!(enabled.return_value, word_from_u64(42));
+        let disabled = vm
+            .execute(
+                &bytes,
+                "increment",
+                &[word_from_u64(41), word_from_bool(false)],
+                200,
+            )
+            .unwrap();
+        assert_eq!(disabled.return_value, word_from_u64(41));
+    }
+
+    #[test]
+    fn local_assignment_fails_closed() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(value: u64) -> u64 { let current = value; current = current + 1; return current; } }",
+                "local binding 'current' is immutable",
+            ),
+            (
+                "contract C { pub fn x(value: u64) -> u64 { value = value + 1; return value; } }",
+                "parameter 'value' is immutable",
+            ),
+            (
+                "contract C { pub fn x(value: u64, replacement: bool) -> u64 { let mut current = value; current = replacement; return current; } }",
+                "local binding 'current' has type u64, expression has type bool",
             ),
         ] {
             assert!(
