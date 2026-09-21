@@ -24,6 +24,9 @@ cargo run -p lithc -- --help
 
 These commands build and test the toolchain. Passing them validates only the capability matrix above. No production installation, signing or deployment command is included.
 
+Reviewed tags can produce draft cross-platform archives and checksums through
+the [preview release process](RELEASE_PROCESS.md).
+
 ## Lithosphere integration
 
 A [local execution experiment](LITHOVM_EXECUTION_LAB.md) remains historical.
