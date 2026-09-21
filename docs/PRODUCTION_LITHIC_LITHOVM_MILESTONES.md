@@ -35,10 +35,12 @@ Status: scalar storage implemented in the version 3 candidate
 
 ## M4 — Host effects and gas
 
-- caller, value, block and chain context;
+Status: deterministic host context implemented in the version 4 candidate
+
+- caller, value, block and chain context implemented behind explicit runtime APIs;
 - events, transfers and contract calls;
 - reentrancy and call-depth policy;
-- versioned opcode and host-call gas schedule;
+- context opcodes use the current versioned instruction gas schedule; host-call gas remains;
 - deterministic receipts and observable failure semantics.
 
 ## M5 — LEP100-15

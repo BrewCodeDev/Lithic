@@ -2,6 +2,9 @@
 
 Status: implementation candidate; transactional scalar storage
 
+Superseded for new compiler output by version 4. Runtime decoding remains
+supported.
+
 Target identifier: `lithovm-native-v3`
 
 Version 3 extends version 2 with a deterministic scalar storage schema,
