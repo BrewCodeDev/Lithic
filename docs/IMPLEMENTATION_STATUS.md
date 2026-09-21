@@ -41,4 +41,7 @@ claim that a `lithic_*` RPC namespace or on-chain native module is deployed.
 
 LEP100-15 is a draft multisignature smart-account standard. See [the supplied draft](../packages/standards/lep100/LEP100-15.md). Its example contracts, SDK calls and deployment configurations are illustrative. No implementation or mainnet address is certified by inclusion in these docs.
 
+Interoperable signing also requires the unresolved normative values listed in
+[LEP100-15 implementation decisions](LEP100_15_IMPLEMENTATION_DECISIONS.md).
+
 Core acceptance requires deterministic signing vectors, domain and nonce replay protection, threshold and unique-signer checks, revocation, atomic execution, reentrancy protection, authorized signer changes, custody tests and contract-signature tests against the supported runtime. Recovery and optional AI/agent profiles require their own tests. Partial implementation must identify unsupported features.
