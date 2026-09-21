@@ -120,16 +120,16 @@ fn lithovm_mode_emits_a_versioned_native_artifact() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"target\": \"lithovm-native-v2\""));
-    assert!(stdout.contains("\"bytecodeVersion\": 2"));
-    assert!(stdout.contains("\"bytecode\": \"0x4c4954484f564d02"));
+    assert!(stdout.contains("\"target\": \"lithovm-native-v3\""));
+    assert!(stdout.contains("\"bytecodeVersion\": 3"));
+    assert!(stdout.contains("\"bytecode\": \"0x4c4954484f564d03"));
 }
 
 #[test]
-fn lithovm_mode_rejects_unsupported_stateful_source() {
+fn lithovm_mode_rejects_unsupported_collection_storage() {
     let path = source_file(
         "lithovm-state",
-        "contract C { state { value: u64; } pub fn answer() -> u64 { return 42; } }",
+        "contract C { state { values: map<address, u64>; } pub fn answer() -> u64 { return 42; } }",
     );
     let output = Command::new(env!("CARGO_BIN_EXE_lithc"))
         .args(["--emit", "lithovm"])
@@ -139,7 +139,6 @@ fn lithovm_mode_rejects_unsupported_stateful_source() {
     fs::remove_file(&path).expect("remove Lithic fixture");
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("state fields are not supported by native LithoVM bytecode v1"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("collection types are unsupported"));
     assert!(output.stdout.is_empty());
 }

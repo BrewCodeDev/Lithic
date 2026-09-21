@@ -26,10 +26,12 @@ Status: implemented in candidate
 
 ## M3 — Transactional state
 
-- deterministic storage layout and namespacing;
-- reads, writes and initialization;
-- atomic commit/revert and rollback on every failure path;
-- state transition, invariant and adversarial tests.
+Status: scalar storage implemented in the version 3 candidate
+
+- deterministic ordered scalar storage schema implemented;
+- typed reads, writes and zero initialization implemented;
+- staged atomic commit and rollback on runtime and out-of-gas failures implemented;
+- remaining collection storage, migrations, namespacing integration and broader adversarial tests.
 
 ## M4 — Host effects and gas
 

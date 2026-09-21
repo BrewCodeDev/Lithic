@@ -2,13 +2,15 @@ use anyhow::{anyhow, bail, Result};
 
 pub const MAGIC: &[u8; 7] = b"LITHOVM";
 pub const LEGACY_VERSION: u8 = 1;
-pub const VERSION: u8 = 2;
+pub const STATEMENT_VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const MAX_FUNCTIONS: usize = 1024;
 pub const MAX_PARAMETERS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_LOCALS: usize = 256;
 pub const MAX_STATEMENTS: usize = 4096;
 pub const MAX_BLOCK_DEPTH: usize = 64;
+pub const MAX_STORAGE_FIELDS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -58,6 +60,10 @@ pub enum Statement {
         expression: Vec<Instruction>,
     },
     Return(Vec<Instruction>),
+    Store {
+        field: u16,
+        expression: Vec<Instruction>,
+    },
     If {
         condition: Vec<Instruction>,
         then_branch: Vec<Statement>,
@@ -70,6 +76,7 @@ pub enum Instruction {
     Constant(ValueType, [u8; 32]),
     Parameter(u16),
     Local(u16),
+    Storage(u16),
     AddU64,
     SubU64,
     MulU64,
@@ -87,16 +94,30 @@ pub struct Function {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageField {
+    pub name: String,
+    pub value_type: ValueType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
+    pub storage: Vec<StorageField>,
     pub functions: Vec<Function>,
 }
 
 impl Program {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        validate_functions(&self.functions)?;
+        validate_storage(&self.storage)?;
+        validate_functions(&self.functions, &self.storage)?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
         bytes.push(VERSION);
+        push_u16(&mut bytes, self.storage.len())?;
+        for field in &self.storage {
+            push_u16(&mut bytes, field.name.len())?;
+            bytes.extend_from_slice(field.name.as_bytes());
+            bytes.push(field.value_type as u8);
+        }
         push_u16(&mut bytes, self.functions.len())?;
         for function in &self.functions {
             push_u16(&mut bytes, function.name.len())?;
@@ -133,9 +154,31 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
         bail!("invalid LithoVM bytecode magic");
     }
     let version = reader.byte()?;
-    if version != LEGACY_VERSION && version != VERSION {
+    if !(LEGACY_VERSION..=VERSION).contains(&version) {
         bail!("unsupported LithoVM bytecode version {version}");
     }
+    let storage = if version >= VERSION {
+        let field_count = reader.u16()? as usize;
+        if field_count > MAX_STORAGE_FIELDS {
+            bail!("too many LithoVM storage fields: {field_count}");
+        }
+        let mut fields = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            let name_len = reader.u16()? as usize;
+            if name_len == 0 || name_len > MAX_NAME_BYTES {
+                bail!("invalid LithoVM storage field name length {name_len}");
+            }
+            let name = std::str::from_utf8(reader.take(name_len)?)
+                .map_err(|_| anyhow!("storage field name is not valid UTF-8"))?
+                .to_owned();
+            let value_type = ValueType::from_byte(reader.byte()?)?;
+            fields.push(StorageField { name, value_type });
+        }
+        validate_storage(&fields)?;
+        fields
+    } else {
+        Vec::new()
+    };
     let function_count = reader.u16()? as usize;
     if function_count == 0 || function_count > MAX_FUNCTIONS {
         bail!("invalid LithoVM function count {function_count}");
@@ -188,12 +231,12 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
                 for _ in 0..instruction_count {
                     instructions.push(decode_instruction(&mut reader, version)?);
                 }
-                validate_expression(&instructions, &parameters, &[], return_type)?;
+                validate_expression(&instructions, &parameters, &[], &storage, return_type)?;
                 ReturnValue::Expression(instructions)
             }
-            4 if version >= VERSION => {
+            4 if version >= STATEMENT_VERSION => {
                 let statements = decode_statements(&mut reader, version, 0)?;
-                validate_statements(&statements, &parameters, return_type, &[], 0)?;
+                validate_statements(&statements, &parameters, return_type, &[], &storage, 0)?;
                 ReturnValue::Statements(statements)
             }
             opcode => bail!("unknown LithoVM return opcode {opcode}"),
@@ -208,8 +251,8 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
     if reader.position != bytes.len() {
         bail!("trailing bytes after LithoVM program");
     }
-    validate_functions(&functions)?;
-    Ok(Program { functions })
+    validate_functions(&functions, &storage)?;
+    Ok(Program { storage, functions })
 }
 
 pub fn validate_word(value_type: ValueType, word: &[u8; 32]) -> Result<()> {
@@ -223,7 +266,29 @@ pub fn validate_word(value_type: ValueType, word: &[u8; 32]) -> Result<()> {
     }
 }
 
-fn validate_functions(functions: &[Function]) -> Result<()> {
+fn validate_storage(storage: &[StorageField]) -> Result<()> {
+    if storage.len() > MAX_STORAGE_FIELDS {
+        bail!("program exceeds {MAX_STORAGE_FIELDS} storage fields");
+    }
+    for (index, field) in storage.iter().enumerate() {
+        if field.name.is_empty()
+            || field.name.len() > MAX_NAME_BYTES
+            || !field.name.is_ascii()
+            || !is_identifier(&field.name)
+        {
+            bail!("invalid LithoVM storage field name '{}'", field.name);
+        }
+        if storage[..index]
+            .iter()
+            .any(|earlier| earlier.name == field.name)
+        {
+            bail!("duplicate LithoVM storage field name '{}'", field.name);
+        }
+    }
+    Ok(())
+}
+
+fn validate_functions(functions: &[Function], storage: &[StorageField]) -> Result<()> {
     if functions.is_empty() || functions.len() > MAX_FUNCTIONS {
         bail!("program must contain between 1 and {MAX_FUNCTIONS} functions");
     }
@@ -260,6 +325,7 @@ fn validate_functions(functions: &[Function]) -> Result<()> {
                     instructions,
                     &function.parameters,
                     &[],
+                    storage,
                     function.return_type,
                 )?;
             }
@@ -269,6 +335,7 @@ fn validate_functions(functions: &[Function]) -> Result<()> {
                     &function.parameters,
                     function.return_type,
                     &[],
+                    storage,
                     0,
                 )?;
             }
@@ -303,6 +370,11 @@ fn encode_statements(bytes: &mut Vec<u8>, statements: &[Statement]) -> Result<()
                 bytes.push(2);
                 encode_expression(bytes, expression)?;
             }
+            Statement::Store { field, expression } => {
+                bytes.push(4);
+                bytes.extend_from_slice(&field.to_be_bytes());
+                encode_expression(bytes, expression)?;
+            }
             Statement::If {
                 condition,
                 then_branch,
@@ -333,6 +405,10 @@ fn encode_instruction(bytes: &mut Vec<u8>, instruction: &Instruction) {
             bytes.push(9);
             bytes.extend_from_slice(&index.to_be_bytes());
         }
+        Instruction::Storage(index) => {
+            bytes.push(10);
+            bytes.extend_from_slice(&index.to_be_bytes());
+        }
         Instruction::AddU64 => bytes.push(3),
         Instruction::SubU64 => bytes.push(4),
         Instruction::MulU64 => bytes.push(5),
@@ -358,7 +434,8 @@ fn decode_instruction(reader: &mut Reader<'_>, version: u8) -> Result<Instructio
         6 => Ok(Instruction::DivU64),
         7 => Ok(Instruction::Eq),
         8 => Ok(Instruction::LtU64),
-        9 if version >= VERSION => Ok(Instruction::Local(reader.u16()?)),
+        9 if version >= STATEMENT_VERSION => Ok(Instruction::Local(reader.u16()?)),
+        10 if version >= VERSION => Ok(Instruction::Storage(reader.u16()?)),
         opcode => bail!("unknown LithoVM instruction opcode {opcode}"),
     }
 }
@@ -396,6 +473,10 @@ fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Resu
                 then_branch: decode_statements(reader, version, depth + 1)?,
                 else_branch: decode_statements(reader, version, depth + 1)?,
             },
+            4 if version >= VERSION => Statement::Store {
+                field: reader.u16()?,
+                expression: decode_expression(reader, version)?,
+            },
             opcode => bail!("unknown LithoVM statement opcode {opcode}"),
         });
     }
@@ -406,6 +487,7 @@ fn validate_expression(
     instructions: &[Instruction],
     parameters: &[ValueType],
     locals: &[ValueType],
+    storage: &[StorageField],
     return_type: ValueType,
 ) -> Result<()> {
     if instructions.is_empty() || instructions.len() > MAX_INSTRUCTIONS {
@@ -427,6 +509,12 @@ fn validate_expression(
                 *locals
                     .get(*index as usize)
                     .ok_or_else(|| anyhow!("expression local index {index} is out of range"))?,
+            ),
+            Instruction::Storage(index) => stack.push(
+                storage
+                    .get(*index as usize)
+                    .ok_or_else(|| anyhow!("expression storage index {index} is out of range"))?
+                    .value_type,
             ),
             Instruction::AddU64
             | Instruction::SubU64
@@ -466,6 +554,7 @@ fn validate_statements(
     parameters: &[ValueType],
     return_type: ValueType,
     inherited_locals: &[ValueType],
+    storage: &[StorageField],
     depth: usize,
 ) -> Result<()> {
     if depth > MAX_BLOCK_DEPTH {
@@ -485,24 +574,45 @@ fn validate_statements(
                 value_type,
                 expression,
             } => {
-                validate_expression(expression, parameters, &locals, *value_type)?;
+                validate_expression(expression, parameters, &locals, storage, *value_type)?;
                 if locals.len() >= MAX_LOCALS {
                     bail!("function exceeds {MAX_LOCALS} local bindings");
                 }
                 locals.push(*value_type);
             }
             Statement::Return(expression) => {
-                validate_expression(expression, parameters, &locals, return_type)?;
+                validate_expression(expression, parameters, &locals, storage, return_type)?;
                 terminal = true;
+            }
+            Statement::Store { field, expression } => {
+                let value_type = storage
+                    .get(*field as usize)
+                    .ok_or_else(|| anyhow!("store field index {field} is out of range"))?
+                    .value_type;
+                validate_expression(expression, parameters, &locals, storage, value_type)?;
             }
             Statement::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                validate_expression(condition, parameters, &locals, ValueType::Bool)?;
-                validate_statements(then_branch, parameters, return_type, &locals, depth + 1)?;
-                validate_statements(else_branch, parameters, return_type, &locals, depth + 1)?;
+                validate_expression(condition, parameters, &locals, storage, ValueType::Bool)?;
+                validate_statements(
+                    then_branch,
+                    parameters,
+                    return_type,
+                    &locals,
+                    storage,
+                    depth + 1,
+                )?;
+                validate_statements(
+                    else_branch,
+                    parameters,
+                    return_type,
+                    &locals,
+                    storage,
+                    depth + 1,
+                )?;
                 terminal = true;
             }
         }
@@ -573,6 +683,7 @@ mod tests {
 
     fn sample() -> Program {
         Program {
+            storage: vec![],
             functions: vec![Function {
                 name: "answer".into(),
                 parameters: vec![],
@@ -618,6 +729,7 @@ mod tests {
     #[test]
     fn typed_expression_round_trips_and_rejects_bad_stacks() {
         let program = Program {
+            storage: vec![],
             functions: vec![Function {
                 name: "add".into(),
                 parameters: vec![ValueType::U64],
@@ -644,6 +756,7 @@ mod tests {
     #[test]
     fn structured_statements_round_trip_and_validate_local_types() {
         let program = Program {
+            storage: vec![],
             functions: vec![Function {
                 name: "choose".into(),
                 parameters: vec![ValueType::U64, ValueType::Bool],
@@ -684,9 +797,46 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_artifacts_remain_readable() {
-        let mut bytes = sample().encode().unwrap();
-        bytes[MAGIC.len()] = LEGACY_VERSION;
-        assert_eq!(parse(&bytes).unwrap(), sample());
+    fn legacy_v1_and_v2_artifacts_remain_readable() {
+        for version in [LEGACY_VERSION, STATEMENT_VERSION] {
+            let mut bytes = sample().encode().unwrap();
+            bytes[MAGIC.len()] = version;
+            bytes.drain(MAGIC.len() + 1..MAGIC.len() + 3);
+            assert_eq!(parse(&bytes).unwrap(), sample());
+        }
+    }
+
+    #[test]
+    fn storage_schema_reads_and_writes_round_trip() {
+        let program = Program {
+            storage: vec![StorageField {
+                name: "count".into(),
+                value_type: ValueType::U64,
+            }],
+            functions: vec![Function {
+                name: "set".into(),
+                parameters: vec![ValueType::U64],
+                return_type: ValueType::U64,
+                return_value: ReturnValue::Statements(vec![
+                    Statement::Store {
+                        field: 0,
+                        expression: vec![Instruction::Parameter(0)],
+                    },
+                    Statement::Return(vec![Instruction::Storage(0)]),
+                ]),
+            }],
+        };
+        let bytes = program.encode().unwrap();
+        assert_eq!(parse(&bytes).unwrap(), program);
+
+        let mut invalid = program;
+        invalid.functions[0].return_value = ReturnValue::Statements(vec![
+            Statement::Store {
+                field: 1,
+                expression: vec![Instruction::Parameter(0)],
+            },
+            Statement::Return(vec![Instruction::Storage(0)]),
+        ]);
+        assert!(invalid.encode().is_err());
     }
 }

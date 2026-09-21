@@ -118,7 +118,7 @@ Lithic is the reference language target for the LEP100 modular protocol stack:
 
 ### Compiler
 
-- `lithc` — parse/check/ABI plus fail-closed EVM and native LithoVM backends for the documented v1 subset  
+- `lithc` — parse/check/ABI plus fail-closed EVM and versioned native LithoVM backends  
 
 ### Developer Experience
 
@@ -170,14 +170,14 @@ Contracts MUST explicitly declare sensitive privileges, enabling:
 
 ## Getting Started
 
-This repository contains preview `lithc 0.2.0` EVM and native LithoVM backends
-for a strict stateless subset. The native target includes static parameters and
-checked `u64` expressions. Read
+This repository contains preview `lithc 0.2.0` EVM and native LithoVM backends.
+The native v3 target includes transactional scalar storage, immutable locals,
+structured branches and checked `u64` expressions. Read
 [EVM backend v1](docs/EVM_BACKEND_V1.md) and
-[Native LithoVM ABI v1](docs/LITHOVM_ABI_V1.md) and
+[Native LithoVM ABI v3](docs/LITHOVM_ABI_V3.md) and
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) for exact capabilities
-and LEP100-15 status. Stateful LithoVM and LEP100-15 execution remain under
-development.
+and LEP100-15 status. Collection storage, host effects and LEP100-15 execution
+remain under development.
 
 ---
 
