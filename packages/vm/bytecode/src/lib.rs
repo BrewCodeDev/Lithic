@@ -1,10 +1,14 @@
 use anyhow::{anyhow, bail, Result};
 
 pub const MAGIC: &[u8; 7] = b"LITHOVM";
-pub const VERSION: u8 = 1;
+pub const LEGACY_VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const MAX_FUNCTIONS: usize = 1024;
 pub const MAX_PARAMETERS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 255;
+pub const MAX_LOCALS: usize = 256;
+pub const MAX_STATEMENTS: usize = 4096;
+pub const MAX_BLOCK_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -44,12 +48,28 @@ pub enum ReturnValue {
     Constant([u8; 32]),
     Parameter(u16),
     Expression(Vec<Instruction>),
+    Statements(Vec<Statement>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Statement {
+    Let {
+        value_type: ValueType,
+        expression: Vec<Instruction>,
+    },
+    Return(Vec<Instruction>),
+    If {
+        condition: Vec<Instruction>,
+        then_branch: Vec<Statement>,
+        else_branch: Vec<Statement>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Instruction {
     Constant(ValueType, [u8; 32]),
     Parameter(u16),
+    Local(u16),
     AddU64,
     SubU64,
     MulU64,
@@ -95,10 +115,11 @@ impl Program {
                 }
                 ReturnValue::Expression(ref instructions) => {
                     bytes.push(3);
-                    push_u16(&mut bytes, instructions.len())?;
-                    for instruction in instructions {
-                        encode_instruction(&mut bytes, instruction);
-                    }
+                    encode_expression(&mut bytes, instructions)?;
+                }
+                ReturnValue::Statements(ref statements) => {
+                    bytes.push(4);
+                    encode_statements(&mut bytes, statements)?;
                 }
             }
         }
@@ -112,7 +133,7 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
         bail!("invalid LithoVM bytecode magic");
     }
     let version = reader.byte()?;
-    if version != VERSION {
+    if version != LEGACY_VERSION && version != VERSION {
         bail!("unsupported LithoVM bytecode version {version}");
     }
     let function_count = reader.u16()? as usize;
@@ -165,10 +186,15 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
                 }
                 let mut instructions = Vec::with_capacity(instruction_count);
                 for _ in 0..instruction_count {
-                    instructions.push(decode_instruction(&mut reader)?);
+                    instructions.push(decode_instruction(&mut reader, version)?);
                 }
-                validate_expression(&instructions, &parameters, return_type)?;
+                validate_expression(&instructions, &parameters, &[], return_type)?;
                 ReturnValue::Expression(instructions)
+            }
+            4 if version >= VERSION => {
+                let statements = decode_statements(&mut reader, version, 0)?;
+                validate_statements(&statements, &parameters, return_type, &[], 0)?;
+                ReturnValue::Statements(statements)
             }
             opcode => bail!("unknown LithoVM return opcode {opcode}"),
         };
@@ -230,7 +256,21 @@ fn validate_functions(functions: &[Function]) -> Result<()> {
                 }
             }
             ReturnValue::Expression(ref instructions) => {
-                validate_expression(instructions, &function.parameters, function.return_type)?;
+                validate_expression(
+                    instructions,
+                    &function.parameters,
+                    &[],
+                    function.return_type,
+                )?;
+            }
+            ReturnValue::Statements(ref statements) => {
+                validate_statements(
+                    statements,
+                    &function.parameters,
+                    function.return_type,
+                    &[],
+                    0,
+                )?;
             }
         }
     }
@@ -238,6 +278,45 @@ fn validate_functions(functions: &[Function]) -> Result<()> {
 }
 
 pub const MAX_INSTRUCTIONS: usize = 4096;
+
+fn encode_expression(bytes: &mut Vec<u8>, instructions: &[Instruction]) -> Result<()> {
+    push_u16(bytes, instructions.len())?;
+    for instruction in instructions {
+        encode_instruction(bytes, instruction);
+    }
+    Ok(())
+}
+
+fn encode_statements(bytes: &mut Vec<u8>, statements: &[Statement]) -> Result<()> {
+    push_u16(bytes, statements.len())?;
+    for statement in statements {
+        match statement {
+            Statement::Let {
+                value_type,
+                expression,
+            } => {
+                bytes.push(1);
+                bytes.push(*value_type as u8);
+                encode_expression(bytes, expression)?;
+            }
+            Statement::Return(expression) => {
+                bytes.push(2);
+                encode_expression(bytes, expression)?;
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                bytes.push(3);
+                encode_expression(bytes, condition)?;
+                encode_statements(bytes, then_branch)?;
+                encode_statements(bytes, else_branch)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 fn encode_instruction(bytes: &mut Vec<u8>, instruction: &Instruction) {
     match instruction {
@@ -250,6 +329,10 @@ fn encode_instruction(bytes: &mut Vec<u8>, instruction: &Instruction) {
             bytes.push(2);
             bytes.extend_from_slice(&index.to_be_bytes());
         }
+        Instruction::Local(index) => {
+            bytes.push(9);
+            bytes.extend_from_slice(&index.to_be_bytes());
+        }
         Instruction::AddU64 => bytes.push(3),
         Instruction::SubU64 => bytes.push(4),
         Instruction::MulU64 => bytes.push(5),
@@ -259,7 +342,7 @@ fn encode_instruction(bytes: &mut Vec<u8>, instruction: &Instruction) {
     }
 }
 
-fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction> {
+fn decode_instruction(reader: &mut Reader<'_>, version: u8) -> Result<Instruction> {
     match reader.byte()? {
         1 => {
             let value_type = ValueType::from_byte(reader.byte()?)?;
@@ -275,13 +358,54 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction> {
         6 => Ok(Instruction::DivU64),
         7 => Ok(Instruction::Eq),
         8 => Ok(Instruction::LtU64),
+        9 if version >= VERSION => Ok(Instruction::Local(reader.u16()?)),
         opcode => bail!("unknown LithoVM instruction opcode {opcode}"),
     }
+}
+
+fn decode_expression(reader: &mut Reader<'_>, version: u8) -> Result<Vec<Instruction>> {
+    let instruction_count = reader.u16()? as usize;
+    if instruction_count == 0 || instruction_count > MAX_INSTRUCTIONS {
+        bail!("invalid LithoVM instruction count {instruction_count}");
+    }
+    let mut instructions = Vec::with_capacity(instruction_count);
+    for _ in 0..instruction_count {
+        instructions.push(decode_instruction(reader, version)?);
+    }
+    Ok(instructions)
+}
+
+fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Result<Vec<Statement>> {
+    if depth > MAX_BLOCK_DEPTH {
+        bail!("LithoVM statement nesting exceeds {MAX_BLOCK_DEPTH}");
+    }
+    let statement_count = reader.u16()? as usize;
+    if statement_count == 0 || statement_count > MAX_STATEMENTS {
+        bail!("invalid LithoVM statement count {statement_count}");
+    }
+    let mut statements = Vec::with_capacity(statement_count);
+    for _ in 0..statement_count {
+        statements.push(match reader.byte()? {
+            1 => Statement::Let {
+                value_type: ValueType::from_byte(reader.byte()?)?,
+                expression: decode_expression(reader, version)?,
+            },
+            2 => Statement::Return(decode_expression(reader, version)?),
+            3 => Statement::If {
+                condition: decode_expression(reader, version)?,
+                then_branch: decode_statements(reader, version, depth + 1)?,
+                else_branch: decode_statements(reader, version, depth + 1)?,
+            },
+            opcode => bail!("unknown LithoVM statement opcode {opcode}"),
+        });
+    }
+    Ok(statements)
 }
 
 fn validate_expression(
     instructions: &[Instruction],
     parameters: &[ValueType],
+    locals: &[ValueType],
     return_type: ValueType,
 ) -> Result<()> {
     if instructions.is_empty() || instructions.len() > MAX_INSTRUCTIONS {
@@ -298,6 +422,11 @@ fn validate_expression(
                 *parameters
                     .get(*index as usize)
                     .ok_or_else(|| anyhow!("expression parameter index {index} is out of range"))?,
+            ),
+            Instruction::Local(index) => stack.push(
+                *locals
+                    .get(*index as usize)
+                    .ok_or_else(|| anyhow!("expression local index {index} is out of range"))?,
             ),
             Instruction::AddU64
             | Instruction::SubU64
@@ -328,6 +457,58 @@ fn validate_expression(
     }
     if stack.as_slice() != [return_type] {
         bail!("expression must leave exactly one value matching the function return type");
+    }
+    Ok(())
+}
+
+fn validate_statements(
+    statements: &[Statement],
+    parameters: &[ValueType],
+    return_type: ValueType,
+    inherited_locals: &[ValueType],
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_BLOCK_DEPTH {
+        bail!("LithoVM statement nesting exceeds {MAX_BLOCK_DEPTH}");
+    }
+    if statements.is_empty() || statements.len() > MAX_STATEMENTS {
+        bail!("statement block size is outside the supported range");
+    }
+    let mut locals = inherited_locals.to_vec();
+    let mut terminal = false;
+    for statement in statements {
+        if terminal {
+            bail!("unreachable statement after terminal return or branch");
+        }
+        match statement {
+            Statement::Let {
+                value_type,
+                expression,
+            } => {
+                validate_expression(expression, parameters, &locals, *value_type)?;
+                if locals.len() >= MAX_LOCALS {
+                    bail!("function exceeds {MAX_LOCALS} local bindings");
+                }
+                locals.push(*value_type);
+            }
+            Statement::Return(expression) => {
+                validate_expression(expression, parameters, &locals, return_type)?;
+                terminal = true;
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                validate_expression(condition, parameters, &locals, ValueType::Bool)?;
+                validate_statements(then_branch, parameters, return_type, &locals, depth + 1)?;
+                validate_statements(else_branch, parameters, return_type, &locals, depth + 1)?;
+                terminal = true;
+            }
+        }
+    }
+    if !terminal {
+        bail!("statement block does not return on every path");
     }
     Ok(())
 }
@@ -458,5 +639,54 @@ mod tests {
         let mut invalid = program;
         invalid.functions[0].return_value = ReturnValue::Expression(vec![Instruction::AddU64]);
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn structured_statements_round_trip_and_validate_local_types() {
+        let program = Program {
+            functions: vec![Function {
+                name: "choose".into(),
+                parameters: vec![ValueType::U64, ValueType::Bool],
+                return_type: ValueType::U64,
+                return_value: ReturnValue::Statements(vec![
+                    Statement::Let {
+                        value_type: ValueType::U64,
+                        expression: vec![Instruction::Parameter(0)],
+                    },
+                    Statement::If {
+                        condition: vec![Instruction::Parameter(1)],
+                        then_branch: vec![Statement::Return(vec![Instruction::Local(0)])],
+                        else_branch: vec![Statement::Return(vec![Instruction::Constant(
+                            ValueType::U64,
+                            {
+                                let mut word = [0; 32];
+                                word[31] = 9;
+                                word
+                            },
+                        )])],
+                    },
+                ]),
+            }],
+        };
+        let bytes = program.encode().unwrap();
+        assert_eq!(bytes[MAGIC.len()], VERSION);
+        assert_eq!(parse(&bytes).unwrap(), program);
+
+        let mut invalid = program;
+        let ReturnValue::Statements(statements) = &mut invalid.functions[0].return_value else {
+            unreachable!()
+        };
+        let Statement::If { then_branch, .. } = &mut statements[1] else {
+            unreachable!()
+        };
+        *then_branch = vec![Statement::Return(vec![Instruction::Local(1)])];
+        assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn legacy_v1_artifacts_remain_readable() {
+        let mut bytes = sample().encode().unwrap();
+        bytes[MAGIC.len()] = LEGACY_VERSION;
+        assert_eq!(parse(&bytes).unwrap(), sample());
     }
 }

@@ -24,8 +24,8 @@ EXAMPLES:
     lithc --emit evm apps/examples/frontend/evm-constants.lithic
     lithc --emit lithovm apps/examples/frontend/evm-constants.lithic
 
-EVM and native LithoVM output support stateless public functions returning a
-constant or a same-typed static parameter.
+EVM output supports its documented stateless subset. Native LithoVM v2 also
+supports immutable locals, typed expressions and structured if/else returns.
 Unsupported semantics reject the complete build."#,
         env!("CARGO_PKG_VERSION")
     );

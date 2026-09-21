@@ -5,11 +5,14 @@
 //! reject the whole compilation; no source behavior is silently discarded.
 
 use lithic_syntax::{Contract, Item, Type};
-use lithovm_bytecode::{Function, Instruction, Program, ReturnValue, ValueType, VERSION};
+use lithovm_bytecode::{
+    Function, Instruction, Program, ReturnValue, Statement, ValueType, MAX_BLOCK_DEPTH, MAX_LOCALS,
+    MAX_STATEMENTS, VERSION,
+};
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v1";
+pub const TARGET: &str = "lithovm-native-v2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,7 +146,7 @@ fn compile_function(
         .iter()
         .map(|parameter| lower_type(&parameter.ty))
         .collect::<Result<Vec<_>, _>>()?;
-    let return_value = parse_return(function, return_type, &parameters)?;
+    let return_value = parse_body(function, return_type, &parameters)?;
     let abi = serde_json::json!({
         "type": "function",
         "name": function.name,
@@ -174,6 +177,300 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             other => Err(format!("type '{other}' has no native LithoVM v1 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
+    }
+}
+
+fn lower_named_type(name: &str) -> Result<ValueType, String> {
+    match name {
+        "u64" => Ok(ValueType::U64),
+        "u256" => Ok(ValueType::U256),
+        "bool" => Ok(ValueType::Bool),
+        "address" => Ok(ValueType::Address),
+        "bytes32" => Ok(ValueType::Bytes32),
+        other => Err(format!("type '{other}' has no native LithoVM v2 lowering")),
+    }
+}
+
+fn parse_body(
+    function: &lithic_syntax::FuncDecl,
+    return_type: ValueType,
+    parameter_types: &[ValueType],
+) -> Result<ReturnValue, String> {
+    let body = function.body_src.trim();
+    if !starts_with_keyword(body, "let") && !starts_with_keyword(body, "if") {
+        return parse_return(function, return_type, parameter_types);
+    }
+    let parameter_names = function
+        .params
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect::<Vec<_>>();
+    let mut parser = BodyParser {
+        source: body,
+        position: 0,
+        parameter_names,
+        parameter_types,
+        local_names: Vec::new(),
+        local_types: Vec::new(),
+        statement_count: 0,
+        return_type,
+    };
+    let statements = parser.parse_block(false, 0)?;
+    Ok(ReturnValue::Statements(statements))
+}
+
+fn starts_with_keyword(source: &str, keyword: &str) -> bool {
+    source
+        .strip_prefix(keyword)
+        .and_then(|remaining| remaining.as_bytes().first())
+        .is_some_and(u8::is_ascii_whitespace)
+}
+
+struct BodyParser<'a> {
+    source: &'a str,
+    position: usize,
+    parameter_names: Vec<&'a str>,
+    parameter_types: &'a [ValueType],
+    local_names: Vec<String>,
+    local_types: Vec<ValueType>,
+    statement_count: usize,
+    return_type: ValueType,
+}
+
+impl BodyParser<'_> {
+    fn parse_block(&mut self, nested: bool, depth: usize) -> Result<Vec<Statement>, String> {
+        if depth > MAX_BLOCK_DEPTH {
+            return Err(format!(
+                "statement nesting exceeds maximum depth {MAX_BLOCK_DEPTH}"
+            ));
+        }
+        let mut statements = Vec::new();
+        let mut terminal = false;
+        loop {
+            self.skip_whitespace();
+            if nested && self.peek_byte() == Some(b'}') {
+                self.position += 1;
+                if !terminal {
+                    return Err("branch does not return on every path".to_string());
+                }
+                return Ok(statements);
+            }
+            if self.position == self.source.len() {
+                if nested {
+                    return Err("unterminated statement block".to_string());
+                }
+                if !terminal {
+                    return Err("function does not return on every path".to_string());
+                }
+                return Ok(statements);
+            }
+            if terminal {
+                return Err("unreachable statement after terminal return or branch".to_string());
+            }
+
+            let statement = if self.consume_keyword("let") {
+                self.parse_let()?
+            } else if self.consume_keyword("return") {
+                terminal = true;
+                self.parse_return_statement()?
+            } else if self.consume_keyword("if") {
+                terminal = true;
+                self.parse_if(depth)?
+            } else {
+                return Err(format!("unsupported statement near '{}'", self.preview()));
+            };
+            self.statement_count += 1;
+            if self.statement_count > MAX_STATEMENTS {
+                return Err(format!("function exceeds {MAX_STATEMENTS} statements"));
+            }
+            statements.push(statement);
+        }
+    }
+
+    fn parse_let(&mut self) -> Result<Statement, String> {
+        self.skip_whitespace();
+        if self.consume_keyword("mut") {
+            return Err("mutable local bindings are not supported yet".to_string());
+        }
+        let name = self.parse_identifier()?;
+        if self.parameter_names.contains(&name.as_str()) || self.local_names.contains(&name) {
+            return Err(format!("duplicate local binding '{name}'"));
+        }
+        self.skip_whitespace();
+        let annotated_type = if self.consume_byte(b':') {
+            self.skip_whitespace();
+            Some(lower_named_type(&self.parse_identifier()?)?)
+        } else {
+            None
+        };
+        self.skip_whitespace();
+        self.expect_byte(b'=', "expected '=' in local binding")?;
+        let expression_source = self.take_expression_until(b';')?.to_owned();
+        let (expression, inferred_type) = self.compile_expression(&expression_source)?;
+        let value_type = annotated_type.unwrap_or(inferred_type);
+        if value_type != inferred_type {
+            return Err(format!(
+                "local binding '{name}' has type {}, expression has type {}",
+                value_type.name(),
+                inferred_type.name()
+            ));
+        }
+        if self.local_names.len() >= MAX_LOCALS {
+            return Err(format!("function exceeds {MAX_LOCALS} local bindings"));
+        }
+        self.local_names.push(name);
+        self.local_types.push(value_type);
+        Ok(Statement::Let {
+            value_type,
+            expression,
+        })
+    }
+
+    fn parse_return_statement(&mut self) -> Result<Statement, String> {
+        let expression_source = self.take_expression_until(b';')?.to_owned();
+        let (expression, expression_type) = self.compile_expression(&expression_source)?;
+        if expression_type != self.return_type {
+            return Err(format!(
+                "return expression has type {}, expected {}",
+                expression_type.name(),
+                self.return_type.name()
+            ));
+        }
+        Ok(Statement::Return(expression))
+    }
+
+    fn parse_if(&mut self, depth: usize) -> Result<Statement, String> {
+        let condition_source = self.take_expression_until(b'{')?.to_owned();
+        let (condition, condition_type) = self.compile_expression(&condition_source)?;
+        if condition_type != ValueType::Bool {
+            return Err(format!(
+                "if condition has type {}, expected bool",
+                condition_type.name()
+            ));
+        }
+
+        let inherited_local_count = self.local_names.len();
+        let then_branch = self.parse_block(true, depth + 1)?;
+        self.local_names.truncate(inherited_local_count);
+        self.local_types.truncate(inherited_local_count);
+
+        self.skip_whitespace();
+        if !self.consume_keyword("else") {
+            return Err("if statement requires an else branch".to_string());
+        }
+        self.skip_whitespace();
+        self.expect_byte(b'{', "expected '{' after else")?;
+        let else_branch = self.parse_block(true, depth + 1)?;
+        self.local_names.truncate(inherited_local_count);
+        self.local_types.truncate(inherited_local_count);
+        Ok(Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+        })
+    }
+
+    fn compile_expression(&self, source: &str) -> Result<(Vec<Instruction>, ValueType), String> {
+        ExpressionParser::new(
+            source,
+            &self.parameter_names,
+            self.parameter_types,
+            &self.local_names,
+            &self.local_types,
+        )?
+        .parse()
+    }
+
+    fn take_expression_until(&mut self, terminator: u8) -> Result<&str, String> {
+        self.skip_whitespace();
+        let start = self.position;
+        let mut parentheses = 0usize;
+        while let Some(byte) = self.peek_byte() {
+            match byte {
+                b'(' => parentheses += 1,
+                b')' => {
+                    parentheses = parentheses
+                        .checked_sub(1)
+                        .ok_or_else(|| "unmatched ')' in expression".to_string())?;
+                }
+                value if value == terminator && parentheses == 0 => {
+                    let expression = self.source[start..self.position].trim();
+                    self.position += 1;
+                    if expression.is_empty() {
+                        return Err("expected expression".to_string());
+                    }
+                    return Ok(expression);
+                }
+                _ => {}
+            }
+            self.position += 1;
+        }
+        Err(format!(
+            "expected '{}' after expression",
+            terminator as char
+        ))
+    }
+
+    fn parse_identifier(&mut self) -> Result<String, String> {
+        self.skip_whitespace();
+        let start = self.position;
+        let Some(first) = self.peek_byte() else {
+            return Err("expected identifier".to_string());
+        };
+        if !first.is_ascii_alphabetic() && first != b'_' {
+            return Err("expected identifier".to_string());
+        }
+        self.position += 1;
+        while matches!(self.peek_byte(), Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            self.position += 1;
+        }
+        Ok(self.source[start..self.position].to_string())
+    }
+
+    fn consume_keyword(&mut self, keyword: &str) -> bool {
+        let remaining = &self.source[self.position..];
+        if !remaining.starts_with(keyword) {
+            return false;
+        }
+        let boundary = remaining.as_bytes().get(keyword.len()).copied();
+        if matches!(boundary, Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_') {
+            return false;
+        }
+        self.position += keyword.len();
+        true
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        if self.peek_byte() == Some(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8, message: &str) -> Result<(), String> {
+        if self.consume_byte(expected) {
+            Ok(())
+        } else {
+            Err(message.to_string())
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek_byte(), Some(byte) if byte.is_ascii_whitespace()) {
+            self.position += 1;
+        }
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.source.as_bytes().get(self.position).copied()
+    }
+
+    fn preview(&self) -> &str {
+        let end = self.source.len().min(self.position + 24);
+        &self.source[self.position..end]
     }
 }
 
@@ -217,6 +514,8 @@ fn parse_return(
             .map(|parameter| parameter.name.as_str())
             .collect::<Vec<_>>(),
         parameter_types,
+        &[],
+        &[],
     )?
     .parse()?;
     if expression_type != return_type {
@@ -306,6 +605,8 @@ struct ExpressionParser<'a> {
     depth: usize,
     parameter_names: &'a [&'a str],
     parameter_types: &'a [ValueType],
+    local_names: &'a [String],
+    local_types: &'a [ValueType],
 }
 
 impl<'a> ExpressionParser<'a> {
@@ -313,6 +614,8 @@ impl<'a> ExpressionParser<'a> {
         source: &str,
         parameter_names: &'a [&'a str],
         parameter_types: &'a [ValueType],
+        local_names: &'a [String],
+        local_types: &'a [ValueType],
     ) -> Result<Self, String> {
         Ok(Self {
             tokens: lex_expression(source)?,
@@ -320,6 +623,8 @@ impl<'a> ExpressionParser<'a> {
             depth: 0,
             parameter_names,
             parameter_types,
+            local_names,
+            local_types,
         })
     }
 
@@ -420,15 +725,23 @@ impl<'a> ExpressionParser<'a> {
                 ValueType::Bool,
             )),
             ExprToken::Ident(name) => {
-                let index = self
+                if let Some(index) = self
                     .parameter_names
                     .iter()
                     .position(|parameter| *parameter == name)
-                    .ok_or_else(|| format!("unknown expression identifier '{name}'"))?;
-                Ok((
-                    vec![Instruction::Parameter(index as u16)],
-                    self.parameter_types[index],
-                ))
+                {
+                    return Ok((
+                        vec![Instruction::Parameter(index as u16)],
+                        self.parameter_types[index],
+                    ));
+                }
+                if let Some(index) = self.local_names.iter().position(|local| *local == name) {
+                    return Ok((
+                        vec![Instruction::Local(index as u16)],
+                        self.local_types[index],
+                    ));
+                }
+                Err(format!("unknown expression identifier '{name}'"))
             }
             ExprToken::LParen => {
                 if self.depth >= MAX_EXPRESSION_DEPTH {
@@ -664,5 +977,80 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("tokens"));
+    }
+
+    #[test]
+    fn compiles_locals_and_executes_only_the_selected_branch() {
+        let artifact = compile(
+            "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
+        )
+        .unwrap();
+        assert_eq!(artifact.target, "lithovm-native-v2");
+        assert_eq!(artifact.bytecode_version, 2);
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+
+        let selected = vm
+            .execute(
+                &bytes,
+                "choose",
+                &[word_from_u64(4), word_from_u64(10)],
+                100,
+            )
+            .unwrap();
+        assert_eq!(selected.return_value, word_from_u64(8));
+
+        let fallback = vm
+            .execute(
+                &bytes,
+                "choose",
+                &[word_from_u64(6), word_from_u64(10)],
+                100,
+            )
+            .unwrap();
+        assert_eq!(fallback.return_value, word_from_u64(11));
+        assert!(fallback.gas_used > selected.gas_used);
+
+        let lazy = compile(
+            "contract C { pub fn safe(flag: bool) -> u64 { if flag { return 7; } else { return 1 / 0; } } }",
+        )
+        .unwrap();
+        let lazy_bytes = hex::decode(&lazy.bytecode[2..]).unwrap();
+        assert_eq!(
+            vm.execute(&lazy_bytes, "safe", &[word_from_u64(1)], 100)
+                .unwrap()
+                .return_value,
+            word_from_u64(7)
+        );
+        assert!(vm
+            .execute(&lazy_bytes, "safe", &[word_from_u64(0)], 100)
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_local_and_control_flow_bodies() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(value: u64) -> u64 { let value = 1; return value; } }",
+                "duplicate local binding",
+            ),
+            (
+                "contract C { pub fn x(value: u64) -> u64 { if value < 1 { return 1; } } }",
+                "requires an else branch",
+            ),
+            (
+                "contract C { pub fn x(value: u64) -> u64 { if value { return 1; } else { return 2; } } }",
+                "if condition has type u64",
+            ),
+            (
+                "contract C { pub fn x(value: u64) -> u64 { let mut next = value; return next; } }",
+                "mutable local bindings",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
     }
 }

@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Result};
-use lithovm_bytecode::{parse, validate_word, Instruction, Program, ReturnValue, ValueType};
+use lithovm_bytecode::{
+    parse, validate_word, Instruction, Program, ReturnValue, Statement, ValueType,
+};
 use lithovm_receipts::ReceiptV1;
 use lithovm_zk_verifier::{StubVerifier, ZkVerifier};
 
@@ -86,6 +88,7 @@ fn execute_program(
     }
     let instruction_count = match &function.return_value {
         ReturnValue::Expression(instructions) => instructions.len() as u64,
+        ReturnValue::Statements(_) => 0,
         _ => 0,
     };
     let gas_used = BASE_CALL_GAS
@@ -105,6 +108,16 @@ fn execute_program(
                 &function.parameters,
                 function.return_type,
                 gas_used,
+            )
+        }
+        ReturnValue::Statements(statements) => {
+            return execute_statements(
+                statements,
+                arguments,
+                &function.parameters,
+                function.return_type,
+                gas_used,
+                gas_limit,
             )
         }
     };
@@ -128,6 +141,24 @@ fn execute_expression(
     return_type: ValueType,
     gas_used: u64,
 ) -> Result<ExecutionResult> {
+    let result = evaluate_expression(instructions, arguments, parameter_types, &[])?;
+    validate_word(return_type, &result.word)?;
+    if result.value_type != return_type {
+        bail!("expression runtime type does not match function return type");
+    }
+    Ok(ExecutionResult {
+        return_type,
+        return_value: result.word,
+        gas_used,
+    })
+}
+
+fn evaluate_expression(
+    instructions: &[Instruction],
+    arguments: &[[u8; 32]],
+    parameter_types: &[ValueType],
+    locals: &[StackValue],
+) -> Result<StackValue> {
     let mut stack: Vec<StackValue> = Vec::new();
     for instruction in instructions {
         match instruction {
@@ -139,6 +170,11 @@ fn execute_expression(
                 value_type: parameter_types[*index as usize],
                 word: arguments[*index as usize],
             }),
+            Instruction::Local(index) => stack.push(
+                *locals
+                    .get(*index as usize)
+                    .ok_or_else(|| anyhow!("runtime local index {index} is out of range"))?,
+            ),
             Instruction::AddU64 => {
                 binary_u64(&mut stack, u64::checked_add, "u64 addition overflow")?
             }
@@ -179,12 +215,115 @@ fn execute_expression(
     if !stack.is_empty() {
         bail!("expression left extra runtime values");
     }
+    Ok(result)
+}
+
+struct GasMeter {
+    used: u64,
+    limit: u64,
+}
+
+impl GasMeter {
+    fn charge(&mut self, amount: u64) -> Result<()> {
+        self.used = self
+            .used
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("gas calculation overflow"))?;
+        if self.used > self.limit {
+            bail!("out of gas: used {}, limit is {}", self.used, self.limit);
+        }
+        Ok(())
+    }
+}
+
+fn execute_statements(
+    statements: &[Statement],
+    arguments: &[[u8; 32]],
+    parameter_types: &[ValueType],
+    return_type: ValueType,
+    base_gas: u64,
+    gas_limit: u64,
+) -> Result<ExecutionResult> {
+    let mut meter = GasMeter {
+        used: base_gas,
+        limit: gas_limit,
+    };
+    if meter.used > meter.limit {
+        bail!(
+            "out of gas: requires at least {}, limit is {}",
+            meter.used,
+            meter.limit
+        );
+    }
+    let mut locals = Vec::new();
+    let result = execute_block(
+        statements,
+        arguments,
+        parameter_types,
+        &mut locals,
+        &mut meter,
+    )?;
+    if result.value_type != return_type {
+        bail!("statement return type does not match function return type");
+    }
     validate_word(return_type, &result.word)?;
     Ok(ExecutionResult {
         return_type,
         return_value: result.word,
-        gas_used,
+        gas_used: meter.used,
     })
+}
+
+fn execute_block(
+    statements: &[Statement],
+    arguments: &[[u8; 32]],
+    parameter_types: &[ValueType],
+    locals: &mut Vec<StackValue>,
+    meter: &mut GasMeter,
+) -> Result<StackValue> {
+    for statement in statements {
+        meter.charge(INSTRUCTION_GAS)?;
+        match statement {
+            Statement::Let {
+                value_type,
+                expression,
+            } => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
+                let value = evaluate_expression(expression, arguments, parameter_types, locals)?;
+                if value.value_type != *value_type {
+                    bail!("local binding runtime type mismatch");
+                }
+                locals.push(value);
+            }
+            Statement::Return(expression) => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
+                return evaluate_expression(expression, arguments, parameter_types, locals);
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(condition.len() as u64))?;
+                let condition = evaluate_expression(condition, arguments, parameter_types, locals)?;
+                if condition.value_type != ValueType::Bool {
+                    bail!("if condition runtime type is not bool");
+                }
+                let local_count = locals.len();
+                let branch = if condition.word == word_from_bool(true) {
+                    then_branch
+                } else if condition.word == word_from_bool(false) {
+                    else_branch
+                } else {
+                    bail!("if condition is not a canonical bool");
+                };
+                let result = execute_block(branch, arguments, parameter_types, locals, meter);
+                locals.truncate(local_count);
+                return result;
+            }
+        }
+    }
+    bail!("statement block completed without returning")
 }
 
 fn binary_u64(
