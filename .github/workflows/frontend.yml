@@ -19,5 +19,6 @@ jobs:
       - run: cargo +1.96.0 run --locked -p lithc -- --emit check apps/examples/frontend/hello.lithic
       - run: cargo +1.96.0 run --locked -p lithc -- --emit evm apps/examples/frontend/evm-constants.lithic
       - run: cargo +1.96.0 run --locked -p lithc -- --emit evm apps/examples/frontend/evm-identity.lithic
+      - run: cargo +1.96.0 run --locked -p lithc -- --emit lithovm apps/examples/frontend/lithovm-statements.lithic
       - run: cargo +1.96.0 run --locked -p lithfmt -- --check apps/examples/frontend/hello.lithic
       - run: cargo +1.96.0 run --locked -p lithlint -- --deny-warnings apps/examples/frontend/hello.lithic

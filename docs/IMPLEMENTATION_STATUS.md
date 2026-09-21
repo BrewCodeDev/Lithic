@@ -4,13 +4,13 @@ This repository contains a preview compiler backend plus development scaffolds. 
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented stateless subset. Native output supports static parameters, constants, identity returns, parentheses, checked `u64` arithmetic, equality and less-than comparison. Unsupported semantics fail the complete build. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented stateless subset. Native v2 output supports static parameters, immutable locals, structured `if`/`else`, checked `u64` arithmetic and comparisons. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |
 | lithls, lithtest, lithsec, lithpkg | Specification-only targets. No usable implementations here. |
 
-The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes the stateless format documented in [Native LithoVM ABI v1](LITHOVM_ABI_V1.md), including checked expression execution and deterministic instruction gas. Local bindings, control flow, storage, calls, events, transfers, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
+The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes the stateless formats documented in [Native LithoVM ABI v2](LITHOVM_ABI_V2.md) and [v1](LITHOVM_ABI_V1.md), including immutable locals, structured branches, checked expression execution and deterministic executed-path gas. Mutable locals, loops, storage, calls, events, transfers, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
 
 ## Local development
 
@@ -28,7 +28,7 @@ These commands build and test the toolchain. Passing them validates only the cap
 
 A [local execution experiment](LITHOVM_EXECUTION_LAB.md) remains historical.
 `lithc --emit lithovm` now emits the versioned native artifact described in
-[Native LithoVM ABI v1](LITHOVM_ABI_V1.md). This establishes the combined
+[Native LithoVM ABI v2](LITHOVM_ABI_V2.md), while retaining v1 decoding compatibility. This establishes the combined
 compiler/runtime boundary; it does not yet establish production readiness.
 
 The tested front end from `KaJLabs/Lithosphere/toolchain` has been imported here. See [import provenance and command changes](FRONTEND_IMPORT.md).

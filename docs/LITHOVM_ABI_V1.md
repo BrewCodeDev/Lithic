@@ -2,6 +2,9 @@
 
 Status: implementation milestone 1; stateless subset
 
+Superseded for new compiler output by version 2. Runtime decoding remains
+supported for compatibility.
+
 Target identifier: `lithovm-native-v1`
 
 This document fixes the first executable boundary shared by `lithc` and the
@@ -52,6 +55,7 @@ declaration or body rejects the whole compilation.
 
 ## Next compatible extensions
 
-Local bindings and control flow, storage transactions and rollback, events,
-caller/value, transfers and calls require new versioned instructions and gas
-rules. They must retain strict decoding and atomic failure.
+Version 2 adds immutable local bindings and structured control flow. Storage
+transactions and rollback, events, caller/value, transfers and calls remain
+future versioned extensions. They must retain strict decoding and atomic
+failure.
