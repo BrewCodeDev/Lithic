@@ -6,14 +6,14 @@ pub const DOMAIN_SEPARATOR: &str = "LITHOSPHERE_AI_RECEIPT_V1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptV1 {
-    pub request_id: String,       // bytes32 hex
-    pub contract_address: String, // address
-    pub provider_id: String,      // string
-    pub model_hash: String,       // bytes32 hex
-    pub input_hash: String,       // bytes32 hex
-    pub output_hash: String,      // bytes32 hex
-    pub cost_used: u128,          // uint256 subset
-    pub timestamp: u64,           // unix seconds
+    pub request_id: String,         // bytes32 hex
+    pub contract_address: String,   // address
+    pub provider_id: String,        // string
+    pub model_hash: String,         // bytes32 hex
+    pub input_hash: String,         // bytes32 hex
+    pub output_hash: String,        // bytes32 hex
+    pub cost_used: u128,            // uint256 subset
+    pub timestamp: u64,             // unix seconds
     pub provider_signature: String, // hex or base64 (provider-defined), verified at higher layer
 }
 

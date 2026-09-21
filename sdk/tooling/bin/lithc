@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "lithc scaffold: compiler entrypoint placeholder"
-echo "Expected future stages: lex -> parse -> typecheck -> capabilities -> IR -> emit artifacts"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+exec cargo run --quiet --locked --manifest-path "$repo_root/Cargo.toml" -p lithc -- "$@"

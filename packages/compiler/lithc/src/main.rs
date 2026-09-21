@@ -1,150 +1,169 @@
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{fs, path::PathBuf};
+//! `lithc` — the Lithic compiler.
+//!
+//! The command exposes declaration checks and fail-closed EVM and native
+//! LithoVM backends for the currently supported stateless language subset.
 
-#[derive(Parser)]
-#[command(name="lithc", version, about="Lithic compiler (scaffold)")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+use std::process::exit;
+
+fn print_help() {
+    eprintln!(
+        r#"lithc {} — Lithic compiler
+
+USAGE:
+    lithc [OPTIONS] <FILE.lithic>
+
+OPTIONS:
+    --emit <KIND>   summary (default), ast, abi, check, evm, bytecode, runtime,
+                    lithovm, lithovm-bytecode
+    -h, --help      Print this help
+
+EXAMPLES:
+    lithc Makalu/contracts/src/DOGE.lithic
+    lithc --emit abi DOGE.lithic
+    lithc --emit check DOGE.lithic
+    lithc --emit evm apps/examples/frontend/evm-constants.lithic
+    lithc --emit lithovm apps/examples/frontend/evm-constants.lithic
+
+EVM and native LithoVM output support stateless public functions returning a
+constant or a same-typed static parameter.
+Unsupported semantics reject the complete build."#,
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Compile a .lithic file into LithoVM bytecode + LEP100 metadata (scaffold)
-    Compile {
-        /// Path to contract source (.lithic)
-        input: PathBuf,
-        /// Output directory
-        #[arg(long, default_value = "./out")]
-        out: PathBuf,
-        /// Strict mode: enforce .lithic extension
-        #[arg(long, default_value_t = true)]
-        strict: bool,
-    },
-}
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mut path: Option<String> = None;
+    let mut emit = String::from("summary");
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Lep100Metadata {
-    lep: String,
-    spec_version: String,
-    contract_name: String,
-    source_hash: String,
-    generated_at: String,
-    capabilities: Vec<String>,
-    ai_services: Vec<String>,
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::Compile { input, out, strict } => compile(input, out, strict),
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--emit" => {
+                i += 1;
+                if i < args.len() {
+                    emit = args[i].clone();
+                } else {
+                    eprintln!("lithc: error: --emit requires a value");
+                    exit(2);
+                }
+            }
+            "-h" | "--help" => {
+                print_help();
+                return;
+            }
+            s if !s.starts_with('-') => path = Some(s.to_string()),
+            other => {
+                eprintln!("lithc: error: unknown option '{}'", other);
+                exit(2);
+            }
+        }
+        i += 1;
     }
-}
 
-fn compile(input: PathBuf, out: PathBuf, strict: bool) -> Result<()> {
-    if strict {
-        let ext_ok = input.extension().and_then(|e| e.to_str()) == Some("lithic");
-        anyhow::ensure!(ext_ok, "Strict mode: input must end with .lithic");
-    }
-
-    let src = fs::read_to_string(&input).with_context(|| format!("read {}", input.display()))?;
-
-    // Extremely small "parser" (scaffold):
-    // - finds `contract <Name>`
-    // - collects `requires ...` capabilities
-    // - collects `ai.service <Name>` services
-    let contract_name = parse_contract_name(&src).unwrap_or_else(|| "UnknownContract".to_string());
-    let capabilities = parse_requires(&src);
-    let ai_services = parse_ai_services(&src);
-
-    // Source hash
-    let mut h = Sha256::new();
-    h.update(src.as_bytes());
-    let source_hash = hex::encode(h.finalize());
-
-    // Dummy bytecode: SHA256(source) prefix for deterministic artifact in scaffold
-    let bytecode = make_dummy_bytecode(&source_hash);
-
-    fs::create_dir_all(&out).with_context(|| format!("create out dir {}", out.display()))?;
-    let bytecode_path = out.join(format!("{contract_name}.lithovm"));
-    fs::write(&bytecode_path, &bytecode).with_context(|| format!("write {}", bytecode_path.display()))?;
-
-    let meta = Lep100Metadata {
-        lep: "LEP100".to_string(),
-        spec_version: "100-1@draft".to_string(),
-        contract_name: contract_name.clone(),
-        source_hash,
-        generated_at: chrono_like_now(),
-        capabilities,
-        ai_services,
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("lithc: error: no input file given\n");
+            print_help();
+            exit(2);
+        }
     };
 
-    let meta_path = out.join(format!("{contract_name}.lep100.json"));
-    fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)
-        .with_context(|| format!("write {}", meta_path.display()))?;
+    let src = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lithc: error: cannot read {}: {}", path, e);
+            exit(2);
+        }
+    };
 
-    println!("Compiled:");
-    println!("  contract: {contract_name}");
-    println!("  bytecode: {}", bytecode_path.display());
-    println!("  metadata: {}", meta_path.display());
-    Ok(())
+    if matches!(emit.as_str(), "evm" | "bytecode" | "runtime") {
+        emit_evm(&src, &emit);
+        return;
+    }
+
+    if matches!(emit.as_str(), "lithovm" | "lithovm-bytecode") {
+        emit_lithovm(&src, &emit);
+        return;
+    }
+
+    let res = lithic_syntax::parse(&src);
+    for d in &res.diagnostics {
+        eprintln!("{}", d.render(&src, &path));
+    }
+
+    let errors = res.error_count();
+    let contract = match res.contract {
+        Some(c) => c,
+        None => {
+            eprintln!("lithc: error: no contract found in {}", path);
+            exit(1);
+        }
+    };
+
+    if errors > 0 {
+        eprintln!("lithc: aborting due to {} error(s)", errors);
+        exit(1);
+    }
+
+    let findings = lithic_syntax::check(&contract);
+    for finding in &findings {
+        eprintln!("{}", finding.render(&path));
+    }
+    let declaration_errors = lithic_syntax::sema::error_count(&findings);
+    if declaration_errors > 0 {
+        eprintln!(
+            "lithc: aborting due to {} declaration error(s)",
+            declaration_errors
+        );
+        exit(1);
+    }
+
+    match emit.as_str() {
+        "check" => eprintln!("{}: declaration checks clean", path),
+        "summary" => print!("{}", contract.summary()),
+        "ast" => println!("{}", contract.to_json()),
+        "abi" => println!("{}", contract.to_abi_json()),
+        other => {
+            eprintln!(
+                "lithc: error: unknown emit kind '{}' (expected summary|ast|abi|check|evm|bytecode|runtime|lithovm|lithovm-bytecode)",
+                other
+            );
+            exit(2);
+        }
+    }
 }
 
-fn parse_contract_name(src: &str) -> Option<String> {
-    for line in src.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("contract ") {
-            let name = rest.split_whitespace().next()?.trim().trim_matches('{').to_string();
-            if !name.is_empty() {
-                return Some(name);
+fn emit_lithovm(source: &str, emit: &str) {
+    match lithic_lithovm::compile(source) {
+        Ok(artifact) => match emit {
+            "lithovm" => println!("{}", artifact.to_json()),
+            "lithovm-bytecode" => println!("{}", artifact.bytecode),
+            _ => unreachable!(),
+        },
+        Err(error) => {
+            for message in error.messages() {
+                eprintln!("lithc: error: {message}");
             }
+            exit(1);
         }
     }
-    None
 }
 
-fn parse_requires(src: &str) -> Vec<String> {
-    for line in src.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("requires ") {
-            return rest
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-    }
-    vec![]
-}
-
-fn parse_ai_services(src: &str) -> Vec<String> {
-    let mut out = vec![];
-    for line in src.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("ai.service ") {
-            if let Some(name) = rest.split_whitespace().next() {
-                out.push(name.trim_matches('{').to_string());
+fn emit_evm(source: &str, emit: &str) {
+    match lithic_evm::compile(source) {
+        Ok(artifact) => match emit {
+            "evm" => println!("{}", artifact.to_json()),
+            "bytecode" => println!("{}", artifact.bytecode),
+            "runtime" => println!("{}", artifact.deployed_bytecode),
+            _ => unreachable!(),
+        },
+        Err(error) => {
+            for message in error.messages() {
+                eprintln!("lithc: error: {message}");
             }
+            exit(1);
         }
     }
-    out
-}
-
-fn make_dummy_bytecode(source_hash_hex: &str) -> Vec<u8> {
-    // "LITHOVM" magic + 32 bytes hash
-    let mut out = Vec::with_capacity(6 + 32);
-    out.extend_from_slice(b"LITHOVM");
-    let hash_bytes = hex::decode(source_hash_hex).unwrap_or_default();
-    out.extend_from_slice(&hash_bytes[..hash_bytes.len().min(32)]);
-    out
-}
-
-fn chrono_like_now() -> String {
-    // No chrono dependency: keep scaffold minimal and deterministic-ish
-    // Use UTC date at build-time-ish; good enough for scaffold. Replace in production.
-    // Format: YYYY-MM-DDTHH:MM:SSZ (placeholder)
-    "2026-02-23T00:00:00Z".to_string()
 }

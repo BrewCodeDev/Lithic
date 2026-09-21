@@ -1,13 +1,15 @@
 [package]
 name = "lithc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "lithc — Lithic frontend and fail-closed EVM artifact compiler."
+
+[[bin]]
+name = "lithc"
+path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-hex = "0.4"
+lithic-evm = { path = "../lithic-evm" }
+lithic-lithovm = { path = "../lithic-lithovm" }
+lithic-syntax = { path = "../lithic-syntax" }

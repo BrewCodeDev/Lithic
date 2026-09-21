@@ -53,7 +53,7 @@ It is designed for:
 - Explicit permissions for sensitive ops (AI calls, transfers, syscalls, zk verification)  
 - Principle-of-least-privilege by construction  
 
-### Production-grade tooling
+### Planned tooling
 
 - `lithc` compiler (.lithic → LithoVM bytecode)  
 - `lithfmt` formatter + `lithlint` security lints  
@@ -118,7 +118,7 @@ Lithic is the reference language target for the LEP100 modular protocol stack:
 
 ### Compiler
 
-- lithc — compile, test, deploy  
+- `lithc` — parse/check/ABI plus fail-closed EVM and native LithoVM backends for the documented v1 subset  
 
 ### Developer Experience
 
@@ -170,18 +170,14 @@ Contracts MUST explicitly declare sensitive privileges, enabling:
 
 ## Getting Started
 
-    # clone repo
-    git clone https://github.com/KaJLabs/lithosphere.git
-    cd lithosphere/lithic
-
-    # build compiler
-    make build
-
-    # compile contract
-    lithc compile examples/risk_analyzer.lithic
-
-    # run tests
-    make test
+This repository contains preview `lithc 0.2.0` EVM and native LithoVM backends
+for a strict stateless subset. The native target includes static parameters and
+checked `u64` expressions. Read
+[EVM backend v1](docs/EVM_BACKEND_V1.md) and
+[Native LithoVM ABI v1](docs/LITHOVM_ABI_V1.md) and
+[Implementation status](docs/IMPLEMENTATION_STATUS.md) for exact capabilities
+and LEP100-15 status. Stateful LithoVM and LEP100-15 execution remain under
+development.
 
 ---
 
