@@ -6,13 +6,13 @@
 
 use lithic_syntax::{Contract, Item, Type};
 use lithovm_bytecode::{
-    Function, Instruction, Program, ReturnValue, Statement, ValueType, MAX_BLOCK_DEPTH, MAX_LOCALS,
-    MAX_STATEMENTS, VERSION,
+    Function, Instruction, Program, ReturnValue, Statement, StorageField, ValueType,
+    MAX_BLOCK_DEPTH, MAX_LOCALS, MAX_STATEMENTS, VERSION,
 };
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v2";
+pub const TARGET: &str = "lithovm-native-v3";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,18 +82,31 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     let mut errors = Vec::new();
     let mut functions = Vec::new();
     let mut abi = Vec::new();
+    let mut storage = Vec::new();
+
+    for item in &contract.items {
+        if let Item::State(state) = item {
+            for field in &state.fields {
+                match lower_type(&field.ty) {
+                    Ok(value_type) => storage.push(StorageField {
+                        name: field.name.clone(),
+                        value_type,
+                    }),
+                    Err(message) => errors.push(format!("state field '{}': {message}", field.name)),
+                }
+            }
+        }
+    }
 
     for item in &contract.items {
         match item {
-            Item::State(state) if !state.fields.is_empty() => errors
-                .push("state fields are not supported by native LithoVM bytecode v1".to_string()),
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v1".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v3".to_string(),
             ),
             Item::Event(_) => errors.push(
-                "event declarations are not supported by native LithoVM bytecode v1".to_string(),
+                "event declarations are not supported by native LithoVM bytecode v3".to_string(),
             ),
-            Item::Func(function) => match compile_function(function) {
+            Item::Func(function) => match compile_function(function, &storage) {
                 Ok((compiled, entry)) => {
                     functions.push(compiled);
                     abi.push(entry);
@@ -110,7 +123,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
         return Err(CompileError { messages: errors });
     }
 
-    let program = Program { functions };
+    let program = Program { storage, functions };
     let bytes = program
         .encode()
         .map_err(|error| CompileError::one(format!("bytecode encoding failed: {error}")))?;
@@ -125,6 +138,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
 
 fn compile_function(
     function: &lithic_syntax::FuncDecl,
+    storage: &[StorageField],
 ) -> Result<(Function, serde_json::Value), String> {
     if !function.is_pub {
         return Err("private functions are unsupported".to_string());
@@ -146,7 +160,7 @@ fn compile_function(
         .iter()
         .map(|parameter| lower_type(&parameter.ty))
         .collect::<Result<Vec<_>, _>>()?;
-    let return_value = parse_body(function, return_type, &parameters)?;
+    let return_value = parse_body(function, return_type, &parameters, storage)?;
     let abi = serde_json::json!({
         "type": "function",
         "name": function.name,
@@ -174,7 +188,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v1 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v3 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -187,7 +201,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v2 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v3 lowering")),
     }
 }
 
@@ -195,10 +209,14 @@ fn parse_body(
     function: &lithic_syntax::FuncDecl,
     return_type: ValueType,
     parameter_types: &[ValueType],
+    storage: &[StorageField],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
-    if !starts_with_keyword(body, "let") && !starts_with_keyword(body, "if") {
-        return parse_return(function, return_type, parameter_types);
+    if !starts_with_keyword(body, "let")
+        && !starts_with_keyword(body, "if")
+        && !body.starts_with("self.")
+    {
+        return parse_return(function, return_type, parameter_types, storage);
     }
     let parameter_names = function
         .params
@@ -212,6 +230,7 @@ fn parse_body(
         parameter_types,
         local_names: Vec::new(),
         local_types: Vec::new(),
+        storage,
         statement_count: 0,
         return_type,
     };
@@ -233,6 +252,7 @@ struct BodyParser<'a> {
     parameter_types: &'a [ValueType],
     local_names: Vec<String>,
     local_types: Vec<ValueType>,
+    storage: &'a [StorageField],
     statement_count: usize,
     return_type: ValueType,
 }
@@ -276,6 +296,8 @@ impl BodyParser<'_> {
             } else if self.consume_keyword("if") {
                 terminal = true;
                 self.parse_if(depth)?
+            } else if self.consume_self_prefix() {
+                self.parse_store()?
             } else {
                 return Err(format!("unsupported statement near '{}'", self.preview()));
             };
@@ -339,6 +361,31 @@ impl BodyParser<'_> {
         Ok(Statement::Return(expression))
     }
 
+    fn parse_store(&mut self) -> Result<Statement, String> {
+        let field_name = self.parse_identifier()?;
+        let field = self
+            .storage
+            .iter()
+            .position(|candidate| candidate.name == field_name)
+            .ok_or_else(|| format!("unknown storage field '{field_name}'"))?;
+        self.skip_whitespace();
+        self.expect_byte(b'=', "expected '=' in storage assignment")?;
+        let expression_source = self.take_expression_until(b';')?.to_owned();
+        let (expression, expression_type) = self.compile_expression(&expression_source)?;
+        let field_type = self.storage[field].value_type;
+        if expression_type != field_type {
+            return Err(format!(
+                "storage field '{field_name}' has type {}, expression has type {}",
+                field_type.name(),
+                expression_type.name()
+            ));
+        }
+        Ok(Statement::Store {
+            field: field as u16,
+            expression,
+        })
+    }
+
     fn parse_if(&mut self, depth: usize) -> Result<Statement, String> {
         let condition_source = self.take_expression_until(b'{')?.to_owned();
         let (condition, condition_type) = self.compile_expression(&condition_source)?;
@@ -377,6 +424,7 @@ impl BodyParser<'_> {
             self.parameter_types,
             &self.local_names,
             &self.local_types,
+            self.storage,
         )?
         .parse()
     }
@@ -441,6 +489,15 @@ impl BodyParser<'_> {
         true
     }
 
+    fn consume_self_prefix(&mut self) -> bool {
+        if self.source[self.position..].starts_with("self.") {
+            self.position += "self.".len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn consume_byte(&mut self, expected: u8) -> bool {
         if self.peek_byte() == Some(expected) {
             self.position += 1;
@@ -478,6 +535,7 @@ fn parse_return(
     function: &lithic_syntax::FuncDecl,
     return_type: ValueType,
     parameter_types: &[ValueType],
+    storage: &[StorageField],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
     let value = body
@@ -516,6 +574,7 @@ fn parse_return(
         parameter_types,
         &[],
         &[],
+        storage,
     )?
     .parse()?;
     if expression_type != return_type {
@@ -607,6 +666,7 @@ struct ExpressionParser<'a> {
     parameter_types: &'a [ValueType],
     local_names: &'a [String],
     local_types: &'a [ValueType],
+    storage: &'a [StorageField],
 }
 
 impl<'a> ExpressionParser<'a> {
@@ -616,6 +676,7 @@ impl<'a> ExpressionParser<'a> {
         parameter_types: &'a [ValueType],
         local_names: &'a [String],
         local_types: &'a [ValueType],
+        storage: &'a [StorageField],
     ) -> Result<Self, String> {
         Ok(Self {
             tokens: lex_expression(source)?,
@@ -625,6 +686,7 @@ impl<'a> ExpressionParser<'a> {
             parameter_types,
             local_names,
             local_types,
+            storage,
         })
     }
 
@@ -725,6 +787,17 @@ impl<'a> ExpressionParser<'a> {
                 ValueType::Bool,
             )),
             ExprToken::Ident(name) => {
+                if let Some(field_name) = name.strip_prefix("self.") {
+                    let index = self
+                        .storage
+                        .iter()
+                        .position(|field| field.name == field_name)
+                        .ok_or_else(|| format!("unknown storage field '{field_name}'"))?;
+                    return Ok((
+                        vec![Instruction::Storage(index as u16)],
+                        self.storage[index].value_type,
+                    ));
+                }
                 if let Some(index) = self
                     .parameter_names
                     .iter()
@@ -826,6 +899,21 @@ fn lex_expression(source: &str) -> Result<Vec<ExprToken>, String> {
             {
                 position += 1;
             }
+            if &source[start..position] == "self" && bytes.get(position) == Some(&b'.') {
+                position += 1;
+                let Some(first) = bytes.get(position) else {
+                    return Err("expected storage field after 'self.'".to_string());
+                };
+                if !first.is_ascii_alphabetic() && *first != b'_' {
+                    return Err("expected storage field after 'self.'".to_string());
+                }
+                position += 1;
+                while position < bytes.len()
+                    && (bytes[position].is_ascii_alphanumeric() || bytes[position] == b'_')
+                {
+                    position += 1;
+                }
+            }
             let name = &source[start..position];
             tokens.push(match name {
                 "true" => ExprToken::Bool(true),
@@ -863,7 +951,7 @@ fn lex_expression(source: &str) -> Result<Vec<ExprToken>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lithovm::{Vm, BASE_CALL_GAS, PARAMETER_GAS};
+    use lithovm::{Storage, Vm, BASE_CALL_GAS, PARAMETER_GAS};
 
     #[test]
     fn compiler_and_native_runtime_execute_the_same_artifact() {
@@ -898,7 +986,7 @@ mod tests {
         let source = "contract C { pub fn answer() -> u64 { return 42; } }";
         assert_eq!(compile(source).unwrap(), compile(source).unwrap());
         for unsupported in [
-            "contract C { state { value: u64; } pub fn x() -> u64 { return 1; } }",
+            "contract C { state { values: map<address, u64>; } pub fn x() -> u64 { return 1; } }",
             "contract C { event Seen { value: u64 } pub fn x() -> u64 { return 1; } }",
             "contract C { pub fn x() -> u64 { return call(); } }",
             "contract C { pub async fn x() -> u64 { return 1; } }",
@@ -985,8 +1073,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v2");
-        assert_eq!(artifact.bytecode_version, 2);
+        assert_eq!(artifact.target, "lithovm-native-v3");
+        assert_eq!(artifact.bytecode_version, 3);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1045,6 +1133,67 @@ mod tests {
             (
                 "contract C { pub fn x(value: u64) -> u64 { let mut next = value; return next; } }",
                 "mutable local bindings",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_storage_commits_atomically_and_rolls_back_failures() {
+        let artifact = compile(
+            "contract Counter { state { count: u64; } pub fn get() -> u64 { return self.count; } pub fn set(value: u64) -> u64 { self.count = value; return self.count; } pub fn fail(value: u64) -> u64 { self.count = value; self.count = value / 0; return self.count; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        let mut storage = Storage::default();
+
+        assert!(vm.execute(&bytes, "get", &[], 100).is_err());
+        assert_eq!(
+            vm.execute_with_storage(&bytes, "get", &[], 100, &mut storage)
+                .unwrap()
+                .return_value,
+            word_from_u64(0)
+        );
+        assert_eq!(
+            vm.execute_with_storage(&bytes, "set", &[word_from_u64(41)], 100, &mut storage,)
+                .unwrap()
+                .return_value,
+            word_from_u64(41)
+        );
+        assert_eq!(storage.get("count"), Some(&word_from_u64(41)));
+
+        assert!(vm
+            .execute_with_storage(
+                &bytes,
+                "set",
+                &[word_from_u64(77)],
+                BASE_CALL_GAS + PARAMETER_GAS + 2,
+                &mut storage,
+            )
+            .is_err());
+        assert_eq!(storage.get("count"), Some(&word_from_u64(41)));
+
+        assert!(vm
+            .execute_with_storage(&bytes, "fail", &[word_from_u64(99)], 100, &mut storage,)
+            .is_err());
+        assert_eq!(storage.get("count"), Some(&word_from_u64(41)));
+    }
+
+    #[test]
+    fn rejects_unknown_or_mistyped_storage_access() {
+        for (source, expected) in [
+            (
+                "contract C { state { value: u64; } pub fn x() -> u64 { return self.missing; } }",
+                "unknown storage field 'missing'",
+            ),
+            (
+                "contract C { state { value: bool; } pub fn x(input: u64) -> bool { self.value = input; return self.value; } }",
+                "storage field 'value' has type bool",
             ),
         ] {
             assert!(

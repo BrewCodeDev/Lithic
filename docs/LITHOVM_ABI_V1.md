@@ -55,7 +55,7 @@ declaration or body rejects the whole compilation.
 
 ## Next compatible extensions
 
-Version 2 adds immutable local bindings and structured control flow. Storage
-transactions and rollback, events, caller/value, transfers and calls remain
-future versioned extensions. They must retain strict decoding and atomic
-failure.
+Version 2 adds immutable local bindings and structured control flow. Version 3
+adds transactional scalar storage. Events, caller/value, transfers and calls
+remain future versioned extensions. They must retain strict decoding and
+atomic failure.

@@ -2,6 +2,9 @@
 
 Status: implementation candidate; stateless typed statements
 
+Superseded for new compiler output by version 3. Runtime decoding remains
+supported for compatibility.
+
 Target identifier: `lithovm-native-v2`
 
 Version 2 extends the version 1 static-value ABI with immutable local bindings
