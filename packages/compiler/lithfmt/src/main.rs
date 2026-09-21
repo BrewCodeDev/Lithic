@@ -27,6 +27,13 @@ OPTIONS:\n\
 }
 
 fn format_source(src: &str) -> String {
+    // Preserve the input's line-ending convention so `--check` behaves the
+    // same on Windows and Unix checkouts. Mixed endings are normalized to the
+    // convention used by the first newline.
+    let newline = match src.find('\n') {
+        Some(index) if index > 0 && src.as_bytes()[index - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    };
     let protected: Vec<(usize, usize)> = lithic_syntax::lexer::lex(src)
         .into_iter()
         .filter_map(|token| match token.kind {
@@ -44,7 +51,10 @@ fn format_source(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut line_start = 0usize;
     for segment in src.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = segment
+            .strip_suffix("\r\n")
+            .or_else(|| segment.strip_suffix('\n'))
+            .unwrap_or(segment);
         let mut content_end = line.len();
         while content_end > 0 {
             let character = line[..content_end]
@@ -66,15 +76,16 @@ fn format_source(src: &str) -> String {
                 out.push(character);
             }
         }
-        out.push('\n');
+        out.push_str(newline);
         line_start += segment.len();
     }
     // Collapse to exactly one trailing newline (handles empty input too).
-    while out.ends_with("\n\n") {
-        out.pop();
+    let doubled_newline = format!("{newline}{newline}");
+    while out.ends_with(&doubled_newline) {
+        out.truncate(out.len() - newline.len());
     }
     if out.is_empty() {
-        out.push('\n');
+        out.push_str(newline);
     }
     out
 }
@@ -173,5 +184,18 @@ mod tests {
         let source = "contract C {\n    fn f() {}\n}\n";
         let once = format_source(source);
         assert_eq!(format_source(&once), once);
+    }
+
+    #[test]
+    fn preserves_windows_line_endings() {
+        let source = "contract C {\r\n    fn f() {}\r\n}\r\n";
+        assert_eq!(format_source(source), source);
+    }
+
+    #[test]
+    fn normalizes_mixed_endings_to_first_convention() {
+        let source = "contract C {\r\n    fn f() {}\n}\r\n";
+        let expected = "contract C {\r\n    fn f() {}\r\n}\r\n";
+        assert_eq!(format_source(source), expected);
     }
 }
