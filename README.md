@@ -171,13 +171,13 @@ Contracts MUST explicitly declare sensitive privileges, enabling:
 ## Getting Started
 
 This repository contains preview `lithc 0.2.0` EVM and native LithoVM backends.
-The native v4 target includes explicit message, block and chain context,
-transactional scalar storage, immutable locals, structured branches and
-checked `u64` expressions. Read
+The native v5 target includes typed event emission, explicit message, block and
+chain context, transactional scalar storage, immutable locals, structured
+branches and checked `u64` expressions. Read
 [EVM backend v1](docs/EVM_BACKEND_V1.md) and
-[Native LithoVM ABI v4](docs/LITHOVM_ABI_V4.md) and
+[Native LithoVM ABI v5](docs/LITHOVM_ABI_V5.md) and
 [Implementation status](docs/IMPLEMENTATION_STATUS.md) for exact capabilities
-and LEP100-15 status. Events, transfers, contract calls, collection storage and
+and LEP100-15 status. Transfers, contract calls, collection storage and
 LEP100-15 execution remain under development.
 
 ---
