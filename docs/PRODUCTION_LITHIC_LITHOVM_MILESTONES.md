@@ -18,7 +18,8 @@ Status: implemented in candidate
 
 ## M2 — Typed executable core
 
-- typed expression and statement AST/IR;
+- typed expression AST/IR (checked `u64` arithmetic and comparisons implemented in candidate);
+- remaining local bindings and statement/control-flow IR;
 - local variables, arithmetic, comparisons and control flow;
 - overflow, division, recursion and resource limits;
 - compiler/runtime differential and fuzz tests.

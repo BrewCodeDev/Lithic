@@ -5,7 +5,7 @@
 //! reject the whole compilation; no source behavior is silently discarded.
 
 use lithic_syntax::{Contract, Item, Type};
-use lithovm_bytecode::{Function, Program, ReturnValue, ValueType, VERSION};
+use lithovm_bytecode::{Function, Instruction, Program, ReturnValue, ValueType, VERSION};
 use serde::Serialize;
 use std::fmt;
 
@@ -206,10 +206,27 @@ fn parse_return(
         }
         return Ok(ReturnValue::Parameter(index as u16));
     }
-    if value.contains(char::is_whitespace) {
-        return Err("constant return expression contains unsupported tokens".to_string());
+    if let Ok(constant) = parse_constant(value, return_type) {
+        return Ok(ReturnValue::Constant(constant));
     }
-    Ok(ReturnValue::Constant(parse_constant(value, return_type)?))
+    let (instructions, expression_type) = ExpressionParser::new(
+        value,
+        &function
+            .params
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+        parameter_types,
+    )?
+    .parse()?;
+    if expression_type != return_type {
+        return Err(format!(
+            "expression has type {}, expected {}",
+            expression_type.name(),
+            return_type.name()
+        ));
+    }
+    Ok(ReturnValue::Expression(instructions))
 }
 
 fn parse_constant(value: &str, value_type: ValueType) -> Result<[u8; 32], String> {
@@ -267,6 +284,269 @@ fn word_from_u64(value: u64) -> [u8; 32] {
     word
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExprToken {
+    Ident(String),
+    Int(String),
+    Bool(bool),
+    LParen,
+    RParen,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    EqEq,
+    Lt,
+    Eof,
+}
+
+struct ExpressionParser<'a> {
+    tokens: Vec<ExprToken>,
+    position: usize,
+    depth: usize,
+    parameter_names: &'a [&'a str],
+    parameter_types: &'a [ValueType],
+}
+
+impl<'a> ExpressionParser<'a> {
+    fn new(
+        source: &str,
+        parameter_names: &'a [&'a str],
+        parameter_types: &'a [ValueType],
+    ) -> Result<Self, String> {
+        Ok(Self {
+            tokens: lex_expression(source)?,
+            position: 0,
+            depth: 0,
+            parameter_names,
+            parameter_types,
+        })
+    }
+
+    fn parse(mut self) -> Result<(Vec<Instruction>, ValueType), String> {
+        let result = self.parse_equality()?;
+        if self.current() != &ExprToken::Eof {
+            return Err("unexpected token after return expression".to_string());
+        }
+        Ok(result)
+    }
+
+    fn parse_equality(&mut self) -> Result<(Vec<Instruction>, ValueType), String> {
+        let mut left = self.parse_comparison()?;
+        while self.eat(&ExprToken::EqEq) {
+            let right = self.parse_comparison()?;
+            if left.1 != right.1 {
+                return Err("equality operands must have the same type".to_string());
+            }
+            left.0.extend(right.0);
+            left.0.push(Instruction::Eq);
+            left.1 = ValueType::Bool;
+        }
+        Ok(left)
+    }
+
+    fn parse_comparison(&mut self) -> Result<(Vec<Instruction>, ValueType), String> {
+        let mut left = self.parse_additive()?;
+        while self.eat(&ExprToken::Lt) {
+            let right = self.parse_additive()?;
+            require_u64_pair(left.1, right.1, "comparison")?;
+            left.0.extend(right.0);
+            left.0.push(Instruction::LtU64);
+            left.1 = ValueType::Bool;
+        }
+        Ok(left)
+    }
+
+    fn parse_additive(&mut self) -> Result<(Vec<Instruction>, ValueType), String> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let instruction = if self.eat(&ExprToken::Plus) {
+                Some(Instruction::AddU64)
+            } else if self.eat(&ExprToken::Minus) {
+                Some(Instruction::SubU64)
+            } else {
+                None
+            };
+            let Some(instruction) = instruction else {
+                break;
+            };
+            let right = self.parse_multiplicative()?;
+            require_u64_pair(left.1, right.1, "arithmetic")?;
+            left.0.extend(right.0);
+            left.0.push(instruction);
+            left.1 = ValueType::U64;
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<(Vec<Instruction>, ValueType), String> {
+        let mut left = self.parse_primary()?;
+        loop {
+            let instruction = if self.eat(&ExprToken::Star) {
+                Some(Instruction::MulU64)
+            } else if self.eat(&ExprToken::Slash) {
+                Some(Instruction::DivU64)
+            } else {
+                None
+            };
+            let Some(instruction) = instruction else {
+                break;
+            };
+            let right = self.parse_primary()?;
+            require_u64_pair(left.1, right.1, "arithmetic")?;
+            left.0.extend(right.0);
+            left.0.push(instruction);
+            left.1 = ValueType::U64;
+        }
+        Ok(left)
+    }
+
+    fn parse_primary(&mut self) -> Result<(Vec<Instruction>, ValueType), String> {
+        match self.bump() {
+            ExprToken::Int(value) => {
+                let value = value
+                    .parse::<u64>()
+                    .map_err(|_| "expression integer exceeds u64".to_string())?;
+                Ok((
+                    vec![Instruction::Constant(ValueType::U64, word_from_u64(value))],
+                    ValueType::U64,
+                ))
+            }
+            ExprToken::Bool(value) => Ok((
+                vec![Instruction::Constant(
+                    ValueType::Bool,
+                    word_from_u64(u64::from(value)),
+                )],
+                ValueType::Bool,
+            )),
+            ExprToken::Ident(name) => {
+                let index = self
+                    .parameter_names
+                    .iter()
+                    .position(|parameter| *parameter == name)
+                    .ok_or_else(|| format!("unknown expression identifier '{name}'"))?;
+                Ok((
+                    vec![Instruction::Parameter(index as u16)],
+                    self.parameter_types[index],
+                ))
+            }
+            ExprToken::LParen => {
+                if self.depth >= MAX_EXPRESSION_DEPTH {
+                    return Err(format!(
+                        "return expression exceeds maximum nesting depth {MAX_EXPRESSION_DEPTH}"
+                    ));
+                }
+                self.depth += 1;
+                let expression = self.parse_equality()?;
+                self.depth -= 1;
+                if !self.eat(&ExprToken::RParen) {
+                    return Err("expected ')' in return expression".to_string());
+                }
+                Ok(expression)
+            }
+            token => Err(format!("expected expression value, found {token:?}")),
+        }
+    }
+
+    fn current(&self) -> &ExprToken {
+        &self.tokens[self.position]
+    }
+
+    fn bump(&mut self) -> ExprToken {
+        let token = self.current().clone();
+        if token != ExprToken::Eof {
+            self.position += 1;
+        }
+        token
+    }
+
+    fn eat(&mut self, expected: &ExprToken) -> bool {
+        if self.current() == expected {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+const MAX_EXPRESSION_SOURCE_BYTES: usize = 65_536;
+const MAX_EXPRESSION_TOKENS: usize = 4_096;
+const MAX_EXPRESSION_DEPTH: usize = 128;
+
+fn require_u64_pair(left: ValueType, right: ValueType, operation: &str) -> Result<(), String> {
+    if left != ValueType::U64 || right != ValueType::U64 {
+        return Err(format!("{operation} currently requires two u64 operands"));
+    }
+    Ok(())
+}
+
+fn lex_expression(source: &str) -> Result<Vec<ExprToken>, String> {
+    if source.len() > MAX_EXPRESSION_SOURCE_BYTES {
+        return Err(format!(
+            "return expression exceeds {MAX_EXPRESSION_SOURCE_BYTES} bytes"
+        ));
+    }
+    let bytes = source.as_bytes();
+    let mut position = 0usize;
+    let mut tokens = Vec::new();
+    while position < bytes.len() {
+        let byte = bytes[position];
+        if byte.is_ascii_whitespace() {
+            position += 1;
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            let start = position;
+            position += 1;
+            while position < bytes.len() && bytes[position].is_ascii_digit() {
+                position += 1;
+            }
+            tokens.push(ExprToken::Int(source[start..position].to_string()));
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = position;
+            position += 1;
+            while position < bytes.len()
+                && (bytes[position].is_ascii_alphanumeric() || bytes[position] == b'_')
+            {
+                position += 1;
+            }
+            let name = &source[start..position];
+            tokens.push(match name {
+                "true" => ExprToken::Bool(true),
+                "false" => ExprToken::Bool(false),
+                _ => ExprToken::Ident(name.to_string()),
+            });
+            continue;
+        }
+        let token = match byte {
+            b'(' => ExprToken::LParen,
+            b')' => ExprToken::RParen,
+            b'+' => ExprToken::Plus,
+            b'-' => ExprToken::Minus,
+            b'*' => ExprToken::Star,
+            b'/' => ExprToken::Slash,
+            b'<' => ExprToken::Lt,
+            b'=' if bytes.get(position + 1) == Some(&b'=') => {
+                position += 1;
+                ExprToken::EqEq
+            }
+            _ => return Err(format!("unsupported expression byte 0x{byte:02x}")),
+        };
+        tokens.push(token);
+        position += 1;
+    }
+    if tokens.len() > MAX_EXPRESSION_TOKENS {
+        return Err(format!(
+            "return expression exceeds {MAX_EXPRESSION_TOKENS} tokens"
+        ));
+    }
+    tokens.push(ExprToken::Eof);
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,10 +587,82 @@ mod tests {
         for unsupported in [
             "contract C { state { value: u64; } pub fn x() -> u64 { return 1; } }",
             "contract C { event Seen { value: u64 } pub fn x() -> u64 { return 1; } }",
-            "contract C { pub fn x() -> u64 { return 1 + 2; } }",
+            "contract C { pub fn x() -> u64 { return call(); } }",
             "contract C { pub async fn x() -> u64 { return 1; } }",
         ] {
             assert!(compile(unsupported).is_err(), "compiled {unsupported}");
         }
+    }
+
+    #[test]
+    fn compiles_precedence_and_executes_checked_u64_expressions() {
+        let artifact = compile(
+            "contract C { pub fn calculate(value: u64) -> u64 { return value + 2 * 3; } pub fn small(value: u64) -> bool { return value < 10; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        let result = vm
+            .execute(&bytes, "calculate", &[word_from_u64(36)], 100)
+            .unwrap();
+        assert_eq!(result.return_value, word_from_u64(42));
+        assert_eq!(
+            vm.execute(&bytes, "small", &[word_from_u64(9)], 100)
+                .unwrap()
+                .return_value,
+            word_from_u64(1)
+        );
+    }
+
+    #[test]
+    fn rejects_expression_type_errors_and_runtime_faults() {
+        assert!(
+            compile("contract C { pub fn bad(flag: bool) -> u64 { return flag + 1; } }")
+                .unwrap_err()
+                .to_string()
+                .contains("requires two u64 operands")
+        );
+        assert!(
+            compile("contract C { pub fn bad(value: u64) -> bool { return value + 1; } }")
+                .unwrap_err()
+                .to_string()
+                .contains("expression has type u64, expected bool")
+        );
+
+        let artifact = compile(
+            "contract C { pub fn divide(value: u64, divisor: u64) -> u64 { return value / divisor; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        assert!(Vm::default()
+            .execute(
+                &bytes,
+                "divide",
+                &[word_from_u64(42), word_from_u64(0)],
+                100,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_expression_depth_and_size() {
+        let nested = format!(
+            "contract C {{ pub fn x() -> u64 {{ return {}1{}; }} }}",
+            "(".repeat(MAX_EXPRESSION_DEPTH + 1),
+            ")".repeat(MAX_EXPRESSION_DEPTH + 1)
+        );
+        assert!(compile(&nested)
+            .unwrap_err()
+            .to_string()
+            .contains("maximum nesting depth"));
+
+        let oversized = format!(
+            "contract C {{ pub fn x() -> u64 {{ return {}; }} }}",
+            "1+".repeat(MAX_EXPRESSION_TOKENS) + "1"
+        );
+        assert!(compile(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("tokens"));
     }
 }

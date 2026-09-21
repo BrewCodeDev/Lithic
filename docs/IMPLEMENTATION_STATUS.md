@@ -4,13 +4,13 @@ This repository contains a preview compiler backend plus development scaffolds. 
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented stateless subset with static parameters and constant or identity returns. Unsupported semantics fail the complete build. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented stateless subset. Native output supports static parameters, constants, identity returns, parentheses, checked `u64` arithmetic, equality and less-than comparison. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |
 | lithls, lithtest, lithsec, lithpkg | Specification-only targets. No usable implementations here. |
 
-The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM now strictly decodes and executes the milestone-1 stateless format documented in [Native LithoVM ABI v1](LITHOVM_ABI_V1.md). Storage, calls, events, transfers, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
+The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes the stateless format documented in [Native LithoVM ABI v1](LITHOVM_ABI_V1.md), including checked expression execution and deterministic instruction gas. Local bindings, control flow, storage, calls, events, transfers, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
 
 ## Local development
 

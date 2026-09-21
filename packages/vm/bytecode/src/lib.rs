@@ -43,6 +43,19 @@ impl ValueType {
 pub enum ReturnValue {
     Constant([u8; 32]),
     Parameter(u16),
+    Expression(Vec<Instruction>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Instruction {
+    Constant(ValueType, [u8; 32]),
+    Parameter(u16),
+    AddU64,
+    SubU64,
+    MulU64,
+    DivU64,
+    Eq,
+    LtU64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +92,13 @@ impl Program {
                 ReturnValue::Parameter(index) => {
                     bytes.push(2);
                     bytes.extend_from_slice(&index.to_be_bytes());
+                }
+                ReturnValue::Expression(ref instructions) => {
+                    bytes.push(3);
+                    push_u16(&mut bytes, instructions.len())?;
+                    for instruction in instructions {
+                        encode_instruction(&mut bytes, instruction);
+                    }
                 }
             }
         }
@@ -137,6 +157,18 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
                     );
                 }
                 ReturnValue::Parameter(index)
+            }
+            3 => {
+                let instruction_count = reader.u16()? as usize;
+                if instruction_count == 0 || instruction_count > MAX_INSTRUCTIONS {
+                    bail!("invalid LithoVM instruction count {instruction_count}");
+                }
+                let mut instructions = Vec::with_capacity(instruction_count);
+                for _ in 0..instruction_count {
+                    instructions.push(decode_instruction(&mut reader)?);
+                }
+                validate_expression(&instructions, &parameters, return_type)?;
+                ReturnValue::Expression(instructions)
             }
             opcode => bail!("unknown LithoVM return opcode {opcode}"),
         };
@@ -197,7 +229,119 @@ fn validate_functions(functions: &[Function]) -> Result<()> {
                     bail!("return parameter type does not match function return type");
                 }
             }
+            ReturnValue::Expression(ref instructions) => {
+                validate_expression(instructions, &function.parameters, function.return_type)?;
+            }
         }
+    }
+    Ok(())
+}
+
+pub const MAX_INSTRUCTIONS: usize = 4096;
+
+fn encode_instruction(bytes: &mut Vec<u8>, instruction: &Instruction) {
+    match instruction {
+        Instruction::Constant(value_type, word) => {
+            bytes.push(1);
+            bytes.push(*value_type as u8);
+            bytes.extend_from_slice(word);
+        }
+        Instruction::Parameter(index) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&index.to_be_bytes());
+        }
+        Instruction::AddU64 => bytes.push(3),
+        Instruction::SubU64 => bytes.push(4),
+        Instruction::MulU64 => bytes.push(5),
+        Instruction::DivU64 => bytes.push(6),
+        Instruction::Eq => bytes.push(7),
+        Instruction::LtU64 => bytes.push(8),
+    }
+}
+
+fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction> {
+    match reader.byte()? {
+        1 => {
+            let value_type = ValueType::from_byte(reader.byte()?)?;
+            let mut word = [0u8; 32];
+            word.copy_from_slice(reader.take(32)?);
+            validate_word(value_type, &word)?;
+            Ok(Instruction::Constant(value_type, word))
+        }
+        2 => Ok(Instruction::Parameter(reader.u16()?)),
+        3 => Ok(Instruction::AddU64),
+        4 => Ok(Instruction::SubU64),
+        5 => Ok(Instruction::MulU64),
+        6 => Ok(Instruction::DivU64),
+        7 => Ok(Instruction::Eq),
+        8 => Ok(Instruction::LtU64),
+        opcode => bail!("unknown LithoVM instruction opcode {opcode}"),
+    }
+}
+
+fn validate_expression(
+    instructions: &[Instruction],
+    parameters: &[ValueType],
+    return_type: ValueType,
+) -> Result<()> {
+    if instructions.is_empty() || instructions.len() > MAX_INSTRUCTIONS {
+        bail!("expression instruction count is outside the supported range");
+    }
+    let mut stack = Vec::new();
+    for instruction in instructions {
+        match instruction {
+            Instruction::Constant(value_type, word) => {
+                validate_word(*value_type, word)?;
+                stack.push(*value_type);
+            }
+            Instruction::Parameter(index) => stack.push(
+                *parameters
+                    .get(*index as usize)
+                    .ok_or_else(|| anyhow!("expression parameter index {index} is out of range"))?,
+            ),
+            Instruction::AddU64
+            | Instruction::SubU64
+            | Instruction::MulU64
+            | Instruction::DivU64 => {
+                pop_expected(&mut stack, ValueType::U64)?;
+                pop_expected(&mut stack, ValueType::U64)?;
+                stack.push(ValueType::U64);
+            }
+            Instruction::Eq => {
+                let right = stack
+                    .pop()
+                    .ok_or_else(|| anyhow!("expression stack underflow"))?;
+                let left = stack
+                    .pop()
+                    .ok_or_else(|| anyhow!("expression stack underflow"))?;
+                if left != right {
+                    bail!("equality operands have different types");
+                }
+                stack.push(ValueType::Bool);
+            }
+            Instruction::LtU64 => {
+                pop_expected(&mut stack, ValueType::U64)?;
+                pop_expected(&mut stack, ValueType::U64)?;
+                stack.push(ValueType::Bool);
+            }
+        }
+    }
+    if stack.as_slice() != [return_type] {
+        bail!("expression must leave exactly one value matching the function return type");
+    }
+    Ok(())
+}
+
+fn pop_expected(stack: &mut Vec<ValueType>, expected: ValueType) -> Result<()> {
+    let actual = stack
+        .pop()
+        .ok_or_else(|| anyhow!("expression stack underflow"))?;
+    if actual != expected {
+        bail!(
+            "expression expected {}, found {}",
+            expected.name(),
+            actual.name()
+        );
     }
     Ok(())
 }
@@ -288,5 +432,31 @@ mod tests {
         let mut program = sample();
         program.functions[0].return_value = ReturnValue::Constant([0xff; 32]);
         assert!(program.encode().is_err());
+    }
+
+    #[test]
+    fn typed_expression_round_trips_and_rejects_bad_stacks() {
+        let program = Program {
+            functions: vec![Function {
+                name: "add".into(),
+                parameters: vec![ValueType::U64],
+                return_type: ValueType::U64,
+                return_value: ReturnValue::Expression(vec![
+                    Instruction::Parameter(0),
+                    Instruction::Constant(ValueType::U64, {
+                        let mut word = [0; 32];
+                        word[31] = 1;
+                        word
+                    }),
+                    Instruction::AddU64,
+                ]),
+            }],
+        };
+        let bytes = program.encode().unwrap();
+        assert_eq!(parse(&bytes).unwrap(), program);
+
+        let mut invalid = program;
+        invalid.functions[0].return_value = ReturnValue::Expression(vec![Instruction::AddU64]);
+        assert!(invalid.encode().is_err());
     }
 }
