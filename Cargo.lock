@@ -1318,6 +1318,7 @@ dependencies = [
  "lithovm-bytecode",
  "serde",
  "serde_json",
+ "sha3",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ This repository contains a preview compiler backend plus development scaffolds. 
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented subset. Native v9 output supports gas-bounded repeat loops, typed mutable and immutable locals, staged outbound contract-call intents and native transfers, typed events, explicit message/block/chain context, transactional scalar storage, structured `if`/`else`, and checked `u64` expressions. Unsupported semantics fail the complete build. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented subset. Native v9 output supports typed literal and `keccak256` constants, gas-bounded repeat loops, typed mutable and immutable locals, staged outbound contract-call intents and native transfers, typed events, explicit message/block/chain context, transactional scalar storage, structured `if`/`else`, and checked `u64` expressions. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |

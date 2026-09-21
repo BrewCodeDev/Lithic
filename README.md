@@ -171,7 +171,7 @@ Contracts MUST explicitly declare sensitive privileges, enabling:
 ## Getting Started
 
 This repository contains preview `lithc 0.2.0` EVM and native LithoVM backends.
-The native v9 target includes gas-bounded repeat loops, mutable and immutable locals, staged outbound
+The native v9 target includes typed contract constants, gas-bounded repeat loops, mutable and immutable locals, staged outbound
 contract-call intents and native-value transfers, typed event emission,
 explicit message, block and chain context, transactional scalar storage,
 structured branches and checked `u64` expressions. Read

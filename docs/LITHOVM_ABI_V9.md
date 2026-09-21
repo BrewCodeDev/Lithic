@@ -14,6 +14,11 @@ Bindings declared inside an iteration are removed after that iteration.
 Assignments to inherited mutable bindings persist. Invalid count types,
 over-limit counts, malformed bytecode and out-of-gas execution fail closed.
 
+The v9 compiler also lowers typed contract constants into existing constant
+instructions. `bytes32` constants may use `keccak256("literal")`; hashing is
+performed at compile time over the literal's UTF-8 bytes and adds no runtime
+opcode.
+
 Versions 1 through 8 retain their encodings. General `while` loops, unbounded
 iteration, recursion and collection storage remain unsupported. Synchronous
 call execution and consensus application of staged effects remain integration

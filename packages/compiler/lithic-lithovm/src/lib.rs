@@ -10,9 +10,17 @@ use lithovm_bytecode::{
     ValueType, MAX_BLOCK_DEPTH, MAX_LOCALS, MAX_STATEMENTS, VERSION,
 };
 use serde::Serialize;
+use sha3::{Digest, Keccak256};
 use std::fmt;
 
 pub const TARGET: &str = "lithovm-native-v9";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompiledConstant {
+    name: String,
+    value_type: ValueType,
+    word: [u8; 32],
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +92,23 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     let mut abi = Vec::new();
     let mut storage = Vec::new();
     let mut events = Vec::new();
+    let mut constants = Vec::new();
+
+    for item in &contract.items {
+        if let Item::Const(constant) = item {
+            match lower_type(&constant.ty).and_then(|value_type| {
+                compile_constant_value(&constant.value_src, value_type)
+                    .map(|word| (value_type, word))
+            }) {
+                Ok((value_type, word)) => constants.push(CompiledConstant {
+                    name: constant.name.clone(),
+                    value_type,
+                    word,
+                }),
+                Err(message) => errors.push(format!("constant '{}': {message}", constant.name)),
+            }
+        }
+    }
 
     for item in &contract.items {
         if let Item::State(state) = item {
@@ -130,11 +155,10 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
 
     for item in &contract.items {
         match item {
-            Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v9".to_string(),
-            ),
+            Item::Const(_) => {}
             Item::Event(_) => {}
-            Item::Func(function) => match compile_function(function, &storage, &events) {
+            Item::Func(function) => match compile_function(function, &constants, &storage, &events)
+            {
                 Ok((compiled, entry)) => {
                     functions.push(compiled);
                     abi.push(entry);
@@ -170,6 +194,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
 
 fn compile_function(
     function: &lithic_syntax::FuncDecl,
+    constants: &[CompiledConstant],
     storage: &[StorageField],
     events: &[EventDefinition],
 ) -> Result<(Function, serde_json::Value), String> {
@@ -193,7 +218,14 @@ fn compile_function(
         .iter()
         .map(|parameter| lower_type(&parameter.ty))
         .collect::<Result<Vec<_>, _>>()?;
-    let return_value = parse_body(function, return_type, &parameters, storage, events)?;
+    let return_value = parse_body(
+        function,
+        return_type,
+        &parameters,
+        constants,
+        storage,
+        events,
+    )?;
     let abi = serde_json::json!({
         "type": "function",
         "name": function.name,
@@ -242,12 +274,13 @@ fn parse_body(
     function: &lithic_syntax::FuncDecl,
     return_type: ValueType,
     parameter_types: &[ValueType],
+    constants: &[CompiledConstant],
     storage: &[StorageField],
     events: &[EventDefinition],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
     if starts_with_keyword(body, "return") {
-        return parse_return(function, return_type, parameter_types, storage);
+        return parse_return(function, return_type, parameter_types, constants, storage);
     }
     let parameter_names = function
         .params
@@ -262,6 +295,7 @@ fn parse_body(
         local_names: Vec::new(),
         local_types: Vec::new(),
         local_mutability: Vec::new(),
+        constants,
         storage,
         events,
         statement_count: 0,
@@ -286,6 +320,7 @@ struct BodyParser<'a> {
     local_names: Vec<String>,
     local_types: Vec<ValueType>,
     local_mutability: Vec<bool>,
+    constants: &'a [CompiledConstant],
     storage: &'a [StorageField],
     events: &'a [EventDefinition],
     statement_count: usize,
@@ -648,6 +683,7 @@ impl BodyParser<'_> {
             self.parameter_types,
             &self.local_names,
             &self.local_types,
+            self.constants,
             self.storage,
         )?
         .parse()
@@ -754,6 +790,7 @@ fn parse_return(
     function: &lithic_syntax::FuncDecl,
     return_type: ValueType,
     parameter_types: &[ValueType],
+    constants: &[CompiledConstant],
     storage: &[StorageField],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
@@ -780,6 +817,17 @@ fn parse_return(
         }
         return Ok(ReturnValue::Parameter(index as u16));
     }
+    if let Some(constant) = constants.iter().find(|constant| constant.name == value) {
+        if constant.value_type != return_type {
+            return Err(format!(
+                "constant '{}' has type {}, expected {}",
+                value,
+                constant.value_type.name(),
+                return_type.name()
+            ));
+        }
+        return Ok(ReturnValue::Constant(constant.word));
+    }
     if let Ok(constant) = parse_constant(value, return_type) {
         return Ok(ReturnValue::Constant(constant));
     }
@@ -793,6 +841,7 @@ fn parse_return(
         parameter_types,
         &[],
         &[],
+        constants,
         storage,
     )?
     .parse()?;
@@ -821,6 +870,32 @@ fn parse_constant(value: &str, value_type: ValueType) -> Result<[u8; 32], String
             .map_err(|_| "u64 return must be an unsigned decimal literal".to_string()),
         ValueType::U256 => parse_u256_decimal(value),
     }
+}
+
+fn compile_constant_value(value: &str, value_type: ValueType) -> Result<[u8; 32], String> {
+    if value_type == ValueType::Bytes32 {
+        if let Some(argument) = value
+            .strip_prefix("keccak256(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            let text = argument
+                .trim()
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .ok_or_else(|| "keccak256 constant requires one string literal".to_string())?;
+            if text.contains('"') || text.contains('\\') {
+                return Err(
+                    "keccak256 constant string cannot contain quotes or escape sequences"
+                        .to_string(),
+                );
+            }
+            let digest = Keccak256::digest(text.as_bytes());
+            let mut word = [0; 32];
+            word.copy_from_slice(&digest);
+            return Ok(word);
+        }
+    }
+    parse_constant(value, value_type)
 }
 
 fn parse_fixed_hex(value: &str, width: usize) -> Result<[u8; 32], String> {
@@ -885,6 +960,7 @@ struct ExpressionParser<'a> {
     parameter_types: &'a [ValueType],
     local_names: &'a [String],
     local_types: &'a [ValueType],
+    constants: &'a [CompiledConstant],
     storage: &'a [StorageField],
 }
 
@@ -895,6 +971,7 @@ impl<'a> ExpressionParser<'a> {
         parameter_types: &'a [ValueType],
         local_names: &'a [String],
         local_types: &'a [ValueType],
+        constants: &'a [CompiledConstant],
         storage: &'a [StorageField],
     ) -> Result<Self, String> {
         Ok(Self {
@@ -905,6 +982,7 @@ impl<'a> ExpressionParser<'a> {
             parameter_types,
             local_names,
             local_types,
+            constants,
             storage,
         })
     }
@@ -1041,6 +1119,12 @@ impl<'a> ExpressionParser<'a> {
                     return Ok((
                         vec![Instruction::Local(index as u16)],
                         self.local_types[index],
+                    ));
+                }
+                if let Some(constant) = self.constants.iter().find(|value| value.name == name) {
+                    return Ok((
+                        vec![Instruction::Constant(constant.value_type, constant.word)],
+                        constant.value_type,
                     ));
                 }
                 Err(format!("unknown expression identifier '{name}'"))
@@ -1838,5 +1922,47 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("repeat count has type bool"));
+    }
+
+    #[test]
+    fn typed_contract_constants_lower_into_existing_instructions() {
+        let artifact = compile(
+            "contract Roles { const LIMIT: u64 = 41; const ADMIN_ROLE: bytes32 = keccak256(\"ADMIN_ROLE\"); pub fn limit() -> u64 { return LIMIT + 1; } pub fn role() -> bytes32 { return ADMIN_ROLE; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        assert_eq!(
+            vm.execute(&bytes, "limit", &[], 100).unwrap().return_value,
+            word_from_u64(42)
+        );
+        let digest = Keccak256::digest(b"ADMIN_ROLE");
+        assert_eq!(
+            vm.execute(&bytes, "role", &[], 100).unwrap().return_value,
+            digest.as_slice()
+        );
+    }
+
+    #[test]
+    fn invalid_contract_constants_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { const BAD: bytes32 = keccak256(ADMIN_ROLE); pub fn x() -> bytes32 { return BAD; } }",
+                "keccak256 constant requires one string literal",
+            ),
+            (
+                "contract C { const FLAG: bool = 2; pub fn x() -> bool { return FLAG; } }",
+                "bool return must be true or false",
+            ),
+            (
+                "contract C { const FLAG: bool = true; pub fn x() -> u64 { return FLAG; } }",
+                "constant 'FLAG' has type bool, expected u64",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
     }
 }
