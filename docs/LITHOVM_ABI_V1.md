@@ -58,4 +58,5 @@ declaration or body rejects the whole compilation.
 Version 2 adds immutable local bindings and structured control flow. Version 3
 adds transactional scalar storage. Version 4 adds explicit message, block and
 chain context. Version 5 adds typed events. Transfers and calls remain future
-versioned extensions. They must retain strict decoding and atomic failure.
+versioned extensions. Version 6 adds staged native transfers; contract calls
+remain future work. Extensions must retain strict decoding and atomic failure.

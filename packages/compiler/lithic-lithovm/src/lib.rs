@@ -12,7 +12,7 @@ use lithovm_bytecode::{
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v5";
+pub const TARGET: &str = "lithovm-native-v6";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,7 +131,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     for item in &contract.items {
         match item {
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v5".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v6".to_string(),
             ),
             Item::Event(_) => {}
             Item::Func(function) => match compile_function(function, &storage, &events) {
@@ -221,7 +221,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v5 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v6 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -234,7 +234,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v5 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v6 lowering")),
     }
 }
 
@@ -249,6 +249,7 @@ fn parse_body(
     if !starts_with_keyword(body, "let")
         && !starts_with_keyword(body, "if")
         && !starts_with_keyword(body, "emit")
+        && !body.starts_with("transfer_native(")
         && !body.starts_with("self.")
     {
         return parse_return(function, return_type, parameter_types, storage);
@@ -335,6 +336,8 @@ impl BodyParser<'_> {
                 self.parse_if(depth)?
             } else if self.consume_keyword("emit") {
                 self.parse_emit()?
+            } else if self.consume_keyword("transfer_native") {
+                self.parse_transfer()?
             } else if self.consume_self_prefix() {
                 self.parse_store()?
             } else {
@@ -483,6 +486,30 @@ impl BodyParser<'_> {
         })
     }
 
+    fn parse_transfer(&mut self) -> Result<Statement, String> {
+        self.skip_whitespace();
+        self.expect_byte(b'(', "expected '(' after transfer_native")?;
+        let recipient_source = self.take_expression_until(b',')?.to_owned();
+        let (recipient, recipient_type) = self.compile_expression(&recipient_source)?;
+        if recipient_type != ValueType::Address {
+            return Err(format!(
+                "transfer recipient has type {}, expected address",
+                recipient_type.name()
+            ));
+        }
+        let amount_source = self.take_expression_until(b')')?.to_owned();
+        let (amount, amount_type) = self.compile_expression(&amount_source)?;
+        if amount_type != ValueType::U256 {
+            return Err(format!(
+                "transfer amount has type {}, expected u256",
+                amount_type.name()
+            ));
+        }
+        self.skip_whitespace();
+        self.expect_byte(b';', "expected ';' after transfer_native")?;
+        Ok(Statement::Transfer { recipient, amount })
+    }
+
     fn parse_if(&mut self, depth: usize) -> Result<Statement, String> {
         let condition_source = self.take_expression_until(b'{')?.to_owned();
         let (condition, condition_type) = self.compile_expression(&condition_source)?;
@@ -532,12 +559,6 @@ impl BodyParser<'_> {
         let mut parentheses = 0usize;
         while let Some(byte) = self.peek_byte() {
             match byte {
-                b'(' => parentheses += 1,
-                b')' => {
-                    parentheses = parentheses
-                        .checked_sub(1)
-                        .ok_or_else(|| "unmatched ')' in expression".to_string())?;
-                }
                 value if value == terminator && parentheses == 0 => {
                     let expression = self.source[start..self.position].trim();
                     self.position += 1;
@@ -545,6 +566,12 @@ impl BodyParser<'_> {
                         return Err("expected expression".to_string());
                     }
                     return Ok(expression);
+                }
+                b'(' => parentheses += 1,
+                b')' => {
+                    parentheses = parentheses
+                        .checked_sub(1)
+                        .ok_or_else(|| "unmatched ')' in expression".to_string())?;
                 }
                 _ => {}
             }
@@ -1180,8 +1207,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v5");
-        assert_eq!(artifact.bytecode_version, 5);
+        assert_eq!(artifact.target, "lithovm-native-v6");
+        assert_eq!(artifact.bytecode_version, 6);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1325,6 +1352,7 @@ mod tests {
             block_height: 91,
             block_timestamp: 1_725_000_000,
             chain_id: 9005,
+            contract_balance: [0; 32],
         };
         let vm = Vm::default();
 
@@ -1416,6 +1444,83 @@ mod tests {
             (
                 "contract C { event Seen { value: u64, account: address } pub fn x() -> u64 { emit Seen { account: 0x0000000000000000000000000000000000000000, value: 1 }; return 1; } }",
                 "expected field 'value'",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_transfers_are_staged_and_balance_checked() {
+        let artifact = compile(
+            "contract Payout { pub fn pay(to: address, amount: u256) -> u256 { transfer_native(to, amount); return amount; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let mut recipient = [0; 32];
+        recipient[12..].copy_from_slice(&[3; 20]);
+        let context = ExecutionContext {
+            contract_balance: word_from_u64(100),
+            chain_id: 9005,
+            ..ExecutionContext::default()
+        };
+        let vm = Vm::default();
+
+        assert!(vm
+            .execute(&bytes, "pay", &[recipient, word_from_u64(40)], 100,)
+            .is_err());
+        let result = vm
+            .execute_with_context(
+                &bytes,
+                "pay",
+                &[recipient, word_from_u64(40)],
+                100,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(result.transfers.len(), 1);
+        assert_eq!(result.transfers[0].recipient, recipient);
+        assert_eq!(result.transfers[0].amount, word_from_u64(40));
+
+        assert!(vm
+            .execute_with_context(
+                &bytes,
+                "pay",
+                &[recipient, word_from_u64(101)],
+                100,
+                &context,
+            )
+            .is_err());
+
+        let twice = compile(
+            "contract Payout { pub fn pay(to: address, first: u256, second: u256) -> u256 { transfer_native(to, first); transfer_native(to, second); return second; } }",
+        )
+        .unwrap();
+        let twice_bytes = hex::decode(&twice.bytecode[2..]).unwrap();
+        assert!(vm
+            .execute_with_context(
+                &twice_bytes,
+                "pay",
+                &[recipient, word_from_u64(60), word_from_u64(41)],
+                200,
+                &context,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn native_transfer_types_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(to: u64, amount: u256) -> u256 { transfer_native(to, amount); return amount; } }",
+                "recipient has type u64",
+            ),
+            (
+                "contract C { pub fn x(to: address, amount: u64) -> u64 { transfer_native(to, amount); return amount; } }",
+                "amount has type u64",
             ),
         ] {
             assert!(

@@ -17,12 +17,19 @@ pub struct ExecutionResult {
     pub return_value: [u8; 32],
     pub gas_used: u64,
     pub events: Vec<EventRecord>,
+    pub transfers: Vec<NativeTransfer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventRecord {
     pub name: String,
     pub fields: Vec<(String, ValueType, [u8; 32])>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTransfer {
+    pub recipient: [u8; 32],
+    pub amount: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,6 +39,7 @@ pub struct ExecutionContext {
     pub block_height: u64,
     pub block_timestamp: u64,
     pub chain_id: u64,
+    pub contract_balance: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -52,6 +60,7 @@ impl Storage {
 pub const BASE_CALL_GAS: u64 = 10;
 pub const PARAMETER_GAS: u64 = 2;
 pub const INSTRUCTION_GAS: u64 = 1;
+pub const NATIVE_TRANSFER_GAS: u64 = 20;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -221,6 +230,8 @@ fn execute_program(
         storage,
         context,
         events: Vec::new(),
+        transfers: Vec::new(),
+        remaining_balance: context.map_or([0; 32], |value| value.contract_balance),
     };
     let return_value = match &function.return_value {
         ReturnValue::Constant(word) => word,
@@ -252,6 +263,7 @@ fn execute_program(
         return_value: *return_value,
         gas_used,
         events: environment.events,
+        transfers: environment.transfers,
     })
 }
 
@@ -259,7 +271,9 @@ fn validate_context(context: &ExecutionContext) -> Result<()> {
     validate_word(ValueType::Address, &context.caller)
         .map_err(|error| anyhow!("execution context caller: {error}"))?;
     validate_word(ValueType::U256, &context.value)
-        .map_err(|error| anyhow!("execution context value: {error}"))
+        .map_err(|error| anyhow!("execution context value: {error}"))?;
+    validate_word(ValueType::U256, &context.contract_balance)
+        .map_err(|error| anyhow!("execution context contract balance: {error}"))
 }
 
 fn prepare_storage(program: &Program, storage: &mut Storage) -> Result<()> {
@@ -288,6 +302,8 @@ struct RuntimeEnvironment<'a> {
     storage: &'a mut Storage,
     context: Option<&'a ExecutionContext>,
     events: Vec<EventRecord>,
+    transfers: Vec<NativeTransfer>,
+    remaining_balance: [u8; 32],
 }
 
 fn execute_expression(
@@ -308,6 +324,7 @@ fn execute_expression(
         return_value: result.word,
         gas_used,
         events: Vec::new(),
+        transfers: Vec::new(),
     })
 }
 
@@ -492,6 +509,7 @@ fn execute_statements(
         return_value: result.word,
         gas_used: meter.used,
         events: std::mem::take(&mut environment.events),
+        transfers: std::mem::take(&mut environment.transfers),
     })
 }
 
@@ -580,6 +598,35 @@ fn execute_block(
                     fields,
                 });
             }
+            Statement::Transfer { recipient, amount } => {
+                meter.charge(NATIVE_TRANSFER_GAS)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(recipient.len() as u64))?;
+                let recipient = evaluate_expression(
+                    recipient,
+                    arguments,
+                    parameter_types,
+                    locals,
+                    environment,
+                )?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(amount.len() as u64))?;
+                let amount =
+                    evaluate_expression(amount, arguments, parameter_types, locals, environment)?;
+                if recipient.value_type != ValueType::Address
+                    || amount.value_type != ValueType::U256
+                {
+                    bail!("native transfer runtime type mismatch");
+                }
+                let _ = environment
+                    .context
+                    .ok_or_else(|| anyhow!("native transfer requires an execution context"))?;
+                environment.remaining_balance =
+                    subtract_u256(environment.remaining_balance, amount.word)
+                        .ok_or_else(|| anyhow!("native transfer exceeds contract balance"))?;
+                environment.transfers.push(NativeTransfer {
+                    recipient: recipient.word,
+                    amount: amount.word,
+                });
+            }
             Statement::If {
                 condition,
                 then_branch,
@@ -666,6 +713,25 @@ fn word_from_bool(value: bool) -> [u8; 32] {
     word
 }
 
+fn subtract_u256(left: [u8; 32], right: [u8; 32]) -> Option<[u8; 32]> {
+    if left < right {
+        return None;
+    }
+    let mut result = [0; 32];
+    let mut borrow = 0i16;
+    for index in (0..32).rev() {
+        let value = left[index] as i16 - right[index] as i16 - borrow;
+        if value < 0 {
+            result[index] = (value + 256) as u8;
+            borrow = 1;
+        } else {
+            result[index] = value as u8;
+            borrow = 0;
+        }
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +741,19 @@ mod tests {
         let mut word = [0u8; 32];
         word[24..].copy_from_slice(&value.to_be_bytes());
         word
+    }
+
+    #[test]
+    fn u256_balance_subtraction_checks_underflow() {
+        assert_eq!(subtract_u256([0xff; 32], [0xff; 32]), Some([0; 32]));
+        let mut one = [0; 32];
+        one[31] = 1;
+        assert_eq!(subtract_u256([0; 32], one), None);
+        let mut high = [0; 32];
+        high[0] = 1;
+        let mut expected = [0xff; 32];
+        expected[0] = 0;
+        assert_eq!(subtract_u256(high, one), Some(expected));
     }
 
     #[test]

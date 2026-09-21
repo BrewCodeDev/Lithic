@@ -120,9 +120,9 @@ fn lithovm_mode_emits_a_versioned_native_artifact() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"target\": \"lithovm-native-v5\""));
-    assert!(stdout.contains("\"bytecodeVersion\": 5"));
-    assert!(stdout.contains("\"bytecode\": \"0x4c4954484f564d05"));
+    assert!(stdout.contains("\"target\": \"lithovm-native-v6\""));
+    assert!(stdout.contains("\"bytecodeVersion\": 6"));
+    assert!(stdout.contains("\"bytecode\": \"0x4c4954484f564d06"));
 }
 
 #[test]

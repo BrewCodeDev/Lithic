@@ -5,7 +5,8 @@ pub const LEGACY_VERSION: u8 = 1;
 pub const STATEMENT_VERSION: u8 = 2;
 pub const STORAGE_VERSION: u8 = 3;
 pub const CONTEXT_VERSION: u8 = 4;
-pub const VERSION: u8 = 5;
+pub const EVENT_VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 pub const MAX_FUNCTIONS: usize = 1024;
 pub const MAX_PARAMETERS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 255;
@@ -71,6 +72,10 @@ pub enum Statement {
     Emit {
         event: u16,
         values: Vec<Vec<Instruction>>,
+    },
+    Transfer {
+        recipient: Vec<Instruction>,
+        amount: Vec<Instruction>,
     },
     If {
         condition: Vec<Instruction>,
@@ -209,7 +214,7 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
     } else {
         Vec::new()
     };
-    let events = if version >= VERSION {
+    let events = if version >= EVENT_VERSION {
         let event_count = reader.u16()? as usize;
         if event_count > MAX_EVENTS {
             bail!("too many LithoVM events: {event_count}");
@@ -484,6 +489,11 @@ fn encode_statements(bytes: &mut Vec<u8>, statements: &[Statement]) -> Result<()
                     encode_expression(bytes, value)?;
                 }
             }
+            Statement::Transfer { recipient, amount } => {
+                bytes.push(6);
+                encode_expression(bytes, recipient)?;
+                encode_expression(bytes, amount)?;
+            }
             Statement::If {
                 condition,
                 then_branch,
@@ -596,7 +606,7 @@ fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Resu
                 field: reader.u16()?,
                 expression: decode_expression(reader, version)?,
             },
-            5 if version >= VERSION => {
+            5 if version >= EVENT_VERSION => {
                 let event = reader.u16()?;
                 let count = reader.u16()? as usize;
                 if count > MAX_EVENT_FIELDS {
@@ -608,6 +618,10 @@ fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Resu
                 }
                 Statement::Emit { event, values }
             }
+            6 if version >= VERSION => Statement::Transfer {
+                recipient: decode_expression(reader, version)?,
+                amount: decode_expression(reader, version)?,
+            },
             opcode => bail!("unknown LithoVM statement opcode {opcode}"),
         });
     }
@@ -741,6 +755,10 @@ fn validate_statements(
                 for (value, field) in values.iter().zip(&definition.fields) {
                     validate_expression(value, parameters, &locals, storage, field.value_type)?;
                 }
+            }
+            Statement::Transfer { recipient, amount } => {
+                validate_expression(recipient, parameters, &locals, storage, ValueType::Address)?;
+                validate_expression(amount, parameters, &locals, storage, ValueType::U256)?;
             }
             Statement::If {
                 condition,
@@ -1008,6 +1026,9 @@ mod tests {
             bytes[MAGIC.len()] = version;
             assert_eq!(parse(&bytes).unwrap(), sample());
         }
+        let mut v5 = sample().encode().unwrap();
+        v5[MAGIC.len()] = EVENT_VERSION;
+        assert_eq!(parse(&v5).unwrap(), sample());
     }
 
     #[test]
@@ -1111,5 +1132,30 @@ mod tests {
             Statement::Return(vec![Instruction::Parameter(0)]),
         ]);
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn native_transfer_statement_round_trips_with_static_types() {
+        let program = Program {
+            storage: vec![],
+            events: vec![],
+            functions: vec![Function {
+                name: "pay".into(),
+                parameters: vec![ValueType::Address, ValueType::U256],
+                return_type: ValueType::U256,
+                return_value: ReturnValue::Statements(vec![
+                    Statement::Transfer {
+                        recipient: vec![Instruction::Parameter(0)],
+                        amount: vec![Instruction::Parameter(1)],
+                    },
+                    Statement::Return(vec![Instruction::Parameter(1)]),
+                ]),
+            }],
+        };
+        let bytes = program.encode().unwrap();
+        assert_eq!(parse(&bytes).unwrap(), program);
+        let mut mislabeled_v5 = bytes;
+        mislabeled_v5[MAGIC.len()] = EVENT_VERSION;
+        assert!(parse(&mislabeled_v5).is_err());
     }
 }
