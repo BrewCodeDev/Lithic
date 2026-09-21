@@ -17,12 +17,28 @@ pub struct ExecutionResult {
     pub return_value: [u8; 32],
     pub gas_used: u64,
     pub events: Vec<EventRecord>,
+    pub transfers: Vec<NativeTransfer>,
+    pub calls: Vec<ContractCall>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventRecord {
     pub name: String,
     pub fields: Vec<(String, ValueType, [u8; 32])>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTransfer {
+    pub recipient: [u8; 32],
+    pub amount: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractCall {
+    pub target: [u8; 32],
+    pub selector: [u8; 32],
+    pub value: [u8; 32],
+    pub depth: u16,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,6 +48,8 @@ pub struct ExecutionContext {
     pub block_height: u64,
     pub block_timestamp: u64,
     pub chain_id: u64,
+    pub contract_balance: [u8; 32],
+    pub call_depth: u16,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -52,6 +70,10 @@ impl Storage {
 pub const BASE_CALL_GAS: u64 = 10;
 pub const PARAMETER_GAS: u64 = 2;
 pub const INSTRUCTION_GAS: u64 = 1;
+pub const NATIVE_TRANSFER_GAS: u64 = 20;
+pub const CONTRACT_CALL_GAS: u64 = 40;
+pub const MAX_CALL_DEPTH: u16 = 32;
+pub const MAX_LOOP_ITERATIONS: u64 = 1024;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -221,6 +243,9 @@ fn execute_program(
         storage,
         context,
         events: Vec::new(),
+        transfers: Vec::new(),
+        calls: Vec::new(),
+        remaining_balance: context.map_or([0; 32], |value| value.contract_balance),
     };
     let return_value = match &function.return_value {
         ReturnValue::Constant(word) => word,
@@ -252,6 +277,8 @@ fn execute_program(
         return_value: *return_value,
         gas_used,
         events: environment.events,
+        transfers: environment.transfers,
+        calls: environment.calls,
     })
 }
 
@@ -259,7 +286,13 @@ fn validate_context(context: &ExecutionContext) -> Result<()> {
     validate_word(ValueType::Address, &context.caller)
         .map_err(|error| anyhow!("execution context caller: {error}"))?;
     validate_word(ValueType::U256, &context.value)
-        .map_err(|error| anyhow!("execution context value: {error}"))
+        .map_err(|error| anyhow!("execution context value: {error}"))?;
+    validate_word(ValueType::U256, &context.contract_balance)
+        .map_err(|error| anyhow!("execution context contract balance: {error}"))?;
+    if context.call_depth > MAX_CALL_DEPTH {
+        bail!("execution context call depth exceeds {MAX_CALL_DEPTH}");
+    }
+    Ok(())
 }
 
 fn prepare_storage(program: &Program, storage: &mut Storage) -> Result<()> {
@@ -288,6 +321,9 @@ struct RuntimeEnvironment<'a> {
     storage: &'a mut Storage,
     context: Option<&'a ExecutionContext>,
     events: Vec<EventRecord>,
+    transfers: Vec<NativeTransfer>,
+    calls: Vec<ContractCall>,
+    remaining_balance: [u8; 32],
 }
 
 fn execute_expression(
@@ -308,6 +344,8 @@ fn execute_expression(
         return_value: result.word,
         gas_used,
         events: Vec::new(),
+        transfers: Vec::new(),
+        calls: Vec::new(),
     })
 }
 
@@ -482,7 +520,8 @@ fn execute_statements(
         &mut locals,
         &mut meter,
         environment,
-    )?;
+    )?
+    .ok_or_else(|| anyhow!("statement block completed without returning"))?;
     if result.value_type != return_type {
         bail!("statement return type does not match function return type");
     }
@@ -492,6 +531,8 @@ fn execute_statements(
         return_value: result.word,
         gas_used: meter.used,
         events: std::mem::take(&mut environment.events),
+        transfers: std::mem::take(&mut environment.transfers),
+        calls: std::mem::take(&mut environment.calls),
     })
 }
 
@@ -502,11 +543,15 @@ fn execute_block(
     locals: &mut Vec<StackValue>,
     meter: &mut GasMeter,
     environment: &mut RuntimeEnvironment<'_>,
-) -> Result<StackValue> {
+) -> Result<Option<StackValue>> {
     for statement in statements {
         meter.charge(INSTRUCTION_GAS)?;
         match statement {
             Statement::Let {
+                value_type,
+                expression,
+            }
+            | Statement::LetMutable {
                 value_type,
                 expression,
             } => {
@@ -523,15 +568,59 @@ fn execute_block(
                 }
                 locals.push(value);
             }
-            Statement::Return(expression) => {
+            Statement::SetLocal { local, expression } => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
-                return evaluate_expression(
+                let value = evaluate_expression(
                     expression,
                     arguments,
                     parameter_types,
                     locals,
                     environment,
-                );
+                )?;
+                let binding = locals
+                    .get_mut(*local as usize)
+                    .ok_or_else(|| anyhow!("runtime local assignment index is out of range"))?;
+                if binding.value_type != value.value_type {
+                    bail!("local assignment runtime type mismatch");
+                }
+                *binding = value;
+            }
+            Statement::Repeat { count, body } => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(count.len() as u64))?;
+                let count =
+                    evaluate_expression(count, arguments, parameter_types, locals, environment)?;
+                if count.value_type != ValueType::U64 || count.word[..24] != [0; 24] {
+                    bail!("repeat count runtime type is not a canonical u64");
+                }
+                let count = u64::from_be_bytes(count.word[24..].try_into().unwrap());
+                if count > MAX_LOOP_ITERATIONS {
+                    bail!("repeat count exceeds {MAX_LOOP_ITERATIONS}");
+                }
+                let local_count = locals.len();
+                for _ in 0..count {
+                    let result = execute_block(
+                        body,
+                        arguments,
+                        parameter_types,
+                        locals,
+                        meter,
+                        environment,
+                    )?;
+                    locals.truncate(local_count);
+                    if result.is_some() {
+                        return Ok(result);
+                    }
+                }
+            }
+            Statement::Return(expression) => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
+                return Ok(Some(evaluate_expression(
+                    expression,
+                    arguments,
+                    parameter_types,
+                    locals,
+                    environment,
+                )?));
             }
             Statement::Store { field, expression } => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
@@ -580,6 +669,72 @@ fn execute_block(
                     fields,
                 });
             }
+            Statement::Transfer { recipient, amount } => {
+                meter.charge(NATIVE_TRANSFER_GAS)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(recipient.len() as u64))?;
+                let recipient = evaluate_expression(
+                    recipient,
+                    arguments,
+                    parameter_types,
+                    locals,
+                    environment,
+                )?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(amount.len() as u64))?;
+                let amount =
+                    evaluate_expression(amount, arguments, parameter_types, locals, environment)?;
+                if recipient.value_type != ValueType::Address
+                    || amount.value_type != ValueType::U256
+                {
+                    bail!("native transfer runtime type mismatch");
+                }
+                let _ = environment
+                    .context
+                    .ok_or_else(|| anyhow!("native transfer requires an execution context"))?;
+                environment.remaining_balance =
+                    subtract_u256(environment.remaining_balance, amount.word)
+                        .ok_or_else(|| anyhow!("native transfer exceeds contract balance"))?;
+                environment.transfers.push(NativeTransfer {
+                    recipient: recipient.word,
+                    amount: amount.word,
+                });
+            }
+            Statement::Call {
+                target,
+                selector,
+                value,
+            } => {
+                meter.charge(CONTRACT_CALL_GAS)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(target.len() as u64))?;
+                let target =
+                    evaluate_expression(target, arguments, parameter_types, locals, environment)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(selector.len() as u64))?;
+                let selector =
+                    evaluate_expression(selector, arguments, parameter_types, locals, environment)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(value.len() as u64))?;
+                let value =
+                    evaluate_expression(value, arguments, parameter_types, locals, environment)?;
+                if target.value_type != ValueType::Address
+                    || selector.value_type != ValueType::Bytes32
+                    || value.value_type != ValueType::U256
+                {
+                    bail!("contract call runtime type mismatch");
+                }
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contract call requires an execution context"))?;
+                if context.call_depth >= MAX_CALL_DEPTH {
+                    bail!("contract call depth limit reached");
+                }
+                environment.remaining_balance =
+                    subtract_u256(environment.remaining_balance, value.word)
+                        .ok_or_else(|| anyhow!("contract call value exceeds contract balance"))?;
+                environment.calls.push(ContractCall {
+                    target: target.word,
+                    selector: selector.word,
+                    value: value.word,
+                    depth: context.call_depth + 1,
+                });
+            }
             Statement::If {
                 condition,
                 then_branch,
@@ -611,13 +766,15 @@ fn execute_block(
                     locals,
                     meter,
                     environment,
-                );
+                )?;
                 locals.truncate(local_count);
-                return result;
+                if result.is_some() {
+                    return Ok(result);
+                }
             }
         }
     }
-    bail!("statement block completed without returning")
+    Ok(None)
 }
 
 fn binary_u64(
@@ -666,6 +823,25 @@ fn word_from_bool(value: bool) -> [u8; 32] {
     word
 }
 
+fn subtract_u256(left: [u8; 32], right: [u8; 32]) -> Option<[u8; 32]> {
+    if left < right {
+        return None;
+    }
+    let mut result = [0; 32];
+    let mut borrow = 0i16;
+    for index in (0..32).rev() {
+        let value = left[index] as i16 - right[index] as i16 - borrow;
+        if value < 0 {
+            result[index] = (value + 256) as u8;
+            borrow = 1;
+        } else {
+            result[index] = value as u8;
+            borrow = 0;
+        }
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +851,19 @@ mod tests {
         let mut word = [0u8; 32];
         word[24..].copy_from_slice(&value.to_be_bytes());
         word
+    }
+
+    #[test]
+    fn u256_balance_subtraction_checks_underflow() {
+        assert_eq!(subtract_u256([0xff; 32], [0xff; 32]), Some([0; 32]));
+        let mut one = [0; 32];
+        one[31] = 1;
+        assert_eq!(subtract_u256([0; 32], one), None);
+        let mut high = [0; 32];
+        high[0] = 1;
+        let mut expected = [0xff; 32];
+        expected[0] = 0;
+        assert_eq!(subtract_u256(high, one), Some(expected));
     }
 
     #[test]

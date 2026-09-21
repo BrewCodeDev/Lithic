@@ -4,13 +4,13 @@ This repository contains a preview compiler backend plus development scaffolds. 
 
 | Tool | Current implementation |
 |---|---|
-| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented subset. Native v5 output supports typed events, explicit message/block/chain context, transactional scalar storage, static parameters, immutable locals, structured `if`/`else`, checked `u64` arithmetic and comparisons. Unsupported semantics fail the complete build. |
+| lithc | Parses/checks declarations and emits ABI plus executable EVM or versioned native LithoVM bytecode for the documented subset. Native v9 output supports typed literal and `keccak256` constants, gas-bounded repeat loops, typed mutable and immutable locals, staged outbound contract-call intents and native transfers, typed events, explicit message/block/chain context, transactional scalar storage, structured `if`/`else`, and checked `u64` expressions. Unsupported semantics fail the complete build. |
 | lithfmt | Parse-checked, literal-preserving whitespace normalization; supports --check. |
 | lithlint | Declaration-level naming and AI-budget rules; supports --deny-warnings. Not a security analyzer. |
 | lithdev | Placeholder shell entrypoint. No deployment execution. |
 | lithls, lithtest, lithsec, lithpkg | Specification-only targets. No usable implementations here. |
 
-The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes [Native LithoVM ABI v5](LITHOVM_ABI_V5.md), [v4](LITHOVM_ABI_V4.md), [v3](LITHOVM_ABI_V3.md), [v2](LITHOVM_ABI_V2.md) and [v1](LITHOVM_ABI_V1.md). Version 5 adds typed deterministic event emission. Version 4 adds explicit `msg.sender`, `msg.value`, `block.height`, `block.timestamp` and `chain.id` inputs. Version 3 adds typed scalar storage with atomic commit and rollback. Mutable locals, loops, collection storage, calls, transfers, receipts and zk authorization are not implemented; receipt and zk placeholders must not be used to authorize anything. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
+The SDK compiler, formatter and linter wrappers invoke the Rust commands from this checkout. lithdev remains a placeholder. The native VM strictly decodes and executes [Native LithoVM ABI v9](LITHOVM_ABI_V9.md) and versions 1 through 8. Version 9 adds gas-bounded repeat loops. Version 8 adds typed mutable local bindings and assignment. Version 7 adds staged outbound call intents. Versions 6 through 3 add native transfers, events, host context and transactional scalar storage. Synchronous calls, return data, general while loops, recursion, collection storage, receipts and zk authorization are not implemented. The EVM target remains documented in [EVM backend v1](EVM_BACKEND_V1.md).
 
 ## Local development
 
@@ -24,11 +24,14 @@ cargo run -p lithc -- --help
 
 These commands build and test the toolchain. Passing them validates only the capability matrix above. No production installation, signing or deployment command is included.
 
+Reviewed tags can produce draft cross-platform archives and checksums through
+the [preview release process](RELEASE_PROCESS.md).
+
 ## Lithosphere integration
 
 A [local execution experiment](LITHOVM_EXECUTION_LAB.md) remains historical.
 `lithc --emit lithovm` now emits the versioned native artifact described in
-[Native LithoVM ABI v5](LITHOVM_ABI_V5.md), while retaining v1 through v4 decoding compatibility. This establishes the combined
+[Native LithoVM ABI v9](LITHOVM_ABI_V9.md), while retaining v1 through v8 decoding compatibility. This establishes the combined
 compiler/runtime boundary; it does not yet establish production readiness.
 
 The tested front end from `KaJLabs/Lithosphere/toolchain` has been imported here. See [import provenance and command changes](FRONTEND_IMPORT.md).
@@ -40,5 +43,8 @@ claim that a `lithic_*` RPC namespace or on-chain native module is deployed.
 ## LEP100-15
 
 LEP100-15 is a draft multisignature smart-account standard. See [the supplied draft](../packages/standards/lep100/LEP100-15.md). Its example contracts, SDK calls and deployment configurations are illustrative. No implementation or mainnet address is certified by inclusion in these docs.
+
+Interoperable signing also requires the unresolved normative values listed in
+[LEP100-15 implementation decisions](LEP100_15_IMPLEMENTATION_DECISIONS.md).
 
 Core acceptance requires deterministic signing vectors, domain and nonce replay protection, threshold and unique-signer checks, revocation, atomic execution, reentrancy protection, authorized signer changes, custody tests and contract-signature tests against the supported runtime. Recovery and optional AI/agent profiles require their own tests. Partial implementation must identify unsupported features.

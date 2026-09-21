@@ -18,9 +18,13 @@ Status: implemented in candidate
 
 ## M2 — Typed executable core
 
+Status: typed expressions, locals, structured branches and bounded repeat loops implemented through version 9
+
 - typed expression AST/IR (checked `u64` arithmetic and comparisons implemented in candidate);
 - immutable local bindings and structured `if`/`else` implemented in the version 2 candidate;
-- remaining mutable bindings, loops and bounded recursion policy;
+- mutable local bindings and typed assignment implemented in the version 8 candidate;
+- gas-bounded repeat loops implemented in the version 9 candidate;
+- remaining general loops and bounded recursion policy;
 - overflow, division, recursion and resource limits;
 - compiler/runtime differential and fuzz tests.
 
@@ -35,12 +39,13 @@ Status: scalar storage implemented in the version 3 candidate
 
 ## M4 — Host effects and gas
 
-Status: deterministic host context and typed events implemented through version 5
+Status: context, events, staged native transfers and outbound call intents implemented through version 7
 
 - caller, value, block and chain context implemented behind explicit runtime APIs;
 - typed ordered event schemas and successful-call event records implemented;
-- remaining transfers and contract calls;
-- reentrancy and call-depth policy;
+- balance-checked staged native transfers implemented;
+- balance-checked staged outbound call intents and a depth limit implemented;
+- remaining synchronous host execution, return data and reentrancy policy;
 - context opcodes use the current versioned instruction gas schedule; host-call gas remains;
 - deterministic receipts and observable failure semantics.
 

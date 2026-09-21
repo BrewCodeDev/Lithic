@@ -10,9 +10,17 @@ use lithovm_bytecode::{
     ValueType, MAX_BLOCK_DEPTH, MAX_LOCALS, MAX_STATEMENTS, VERSION,
 };
 use serde::Serialize;
+use sha3::{Digest, Keccak256};
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v5";
+pub const TARGET: &str = "lithovm-native-v9";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompiledConstant {
+    name: String,
+    value_type: ValueType,
+    word: [u8; 32],
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +92,23 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     let mut abi = Vec::new();
     let mut storage = Vec::new();
     let mut events = Vec::new();
+    let mut constants = Vec::new();
+
+    for item in &contract.items {
+        if let Item::Const(constant) = item {
+            match lower_type(&constant.ty).and_then(|value_type| {
+                compile_constant_value(&constant.value_src, value_type)
+                    .map(|word| (value_type, word))
+            }) {
+                Ok((value_type, word)) => constants.push(CompiledConstant {
+                    name: constant.name.clone(),
+                    value_type,
+                    word,
+                }),
+                Err(message) => errors.push(format!("constant '{}': {message}", constant.name)),
+            }
+        }
+    }
 
     for item in &contract.items {
         if let Item::State(state) = item {
@@ -130,11 +155,10 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
 
     for item in &contract.items {
         match item {
-            Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v5".to_string(),
-            ),
+            Item::Const(_) => {}
             Item::Event(_) => {}
-            Item::Func(function) => match compile_function(function, &storage, &events) {
+            Item::Func(function) => match compile_function(function, &constants, &storage, &events)
+            {
                 Ok((compiled, entry)) => {
                     functions.push(compiled);
                     abi.push(entry);
@@ -170,6 +194,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
 
 fn compile_function(
     function: &lithic_syntax::FuncDecl,
+    constants: &[CompiledConstant],
     storage: &[StorageField],
     events: &[EventDefinition],
 ) -> Result<(Function, serde_json::Value), String> {
@@ -193,7 +218,14 @@ fn compile_function(
         .iter()
         .map(|parameter| lower_type(&parameter.ty))
         .collect::<Result<Vec<_>, _>>()?;
-    let return_value = parse_body(function, return_type, &parameters, storage, events)?;
+    let return_value = parse_body(
+        function,
+        return_type,
+        &parameters,
+        constants,
+        storage,
+        events,
+    )?;
     let abi = serde_json::json!({
         "type": "function",
         "name": function.name,
@@ -221,7 +253,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v5 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v9 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -234,7 +266,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v5 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v9 lowering")),
     }
 }
 
@@ -242,16 +274,13 @@ fn parse_body(
     function: &lithic_syntax::FuncDecl,
     return_type: ValueType,
     parameter_types: &[ValueType],
+    constants: &[CompiledConstant],
     storage: &[StorageField],
     events: &[EventDefinition],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
-    if !starts_with_keyword(body, "let")
-        && !starts_with_keyword(body, "if")
-        && !starts_with_keyword(body, "emit")
-        && !body.starts_with("self.")
-    {
-        return parse_return(function, return_type, parameter_types, storage);
+    if starts_with_keyword(body, "return") {
+        return parse_return(function, return_type, parameter_types, constants, storage);
     }
     let parameter_names = function
         .params
@@ -265,12 +294,14 @@ fn parse_body(
         parameter_types,
         local_names: Vec::new(),
         local_types: Vec::new(),
+        local_mutability: Vec::new(),
+        constants,
         storage,
         events,
         statement_count: 0,
         return_type,
     };
-    let statements = parser.parse_block(false, 0)?;
+    let statements = parser.parse_block(false, 0, true)?;
     Ok(ReturnValue::Statements(statements))
 }
 
@@ -288,6 +319,8 @@ struct BodyParser<'a> {
     parameter_types: &'a [ValueType],
     local_names: Vec<String>,
     local_types: Vec<ValueType>,
+    local_mutability: Vec<bool>,
+    constants: &'a [CompiledConstant],
     storage: &'a [StorageField],
     events: &'a [EventDefinition],
     statement_count: usize,
@@ -295,7 +328,12 @@ struct BodyParser<'a> {
 }
 
 impl BodyParser<'_> {
-    fn parse_block(&mut self, nested: bool, depth: usize) -> Result<Vec<Statement>, String> {
+    fn parse_block(
+        &mut self,
+        nested: bool,
+        depth: usize,
+        require_return: bool,
+    ) -> Result<Vec<Statement>, String> {
         if depth > MAX_BLOCK_DEPTH {
             return Err(format!(
                 "statement nesting exceeds maximum depth {MAX_BLOCK_DEPTH}"
@@ -307,7 +345,7 @@ impl BodyParser<'_> {
             self.skip_whitespace();
             if nested && self.peek_byte() == Some(b'}') {
                 self.position += 1;
-                if !terminal {
+                if require_return && !terminal {
                     return Err("branch does not return on every path".to_string());
                 }
                 return Ok(statements);
@@ -316,7 +354,7 @@ impl BodyParser<'_> {
                 if nested {
                     return Err("unterminated statement block".to_string());
                 }
-                if !terminal {
+                if require_return && !terminal {
                     return Err("function does not return on every path".to_string());
                 }
                 return Ok(statements);
@@ -333,12 +371,18 @@ impl BodyParser<'_> {
             } else if self.consume_keyword("if") {
                 terminal = true;
                 self.parse_if(depth)?
+            } else if self.consume_keyword("repeat") {
+                self.parse_repeat(depth)?
             } else if self.consume_keyword("emit") {
                 self.parse_emit()?
+            } else if self.consume_keyword("transfer_native") {
+                self.parse_transfer()?
+            } else if self.consume_keyword("call_contract") {
+                self.parse_call()?
             } else if self.consume_self_prefix() {
                 self.parse_store()?
             } else {
-                return Err(format!("unsupported statement near '{}'", self.preview()));
+                self.parse_local_assignment()?
             };
             self.statement_count += 1;
             if self.statement_count > MAX_STATEMENTS {
@@ -350,9 +394,7 @@ impl BodyParser<'_> {
 
     fn parse_let(&mut self) -> Result<Statement, String> {
         self.skip_whitespace();
-        if self.consume_keyword("mut") {
-            return Err("mutable local bindings are not supported yet".to_string());
-        }
+        let mutable = self.consume_keyword("mut");
         let name = self.parse_identifier()?;
         if self.parameter_names.contains(&name.as_str()) || self.local_names.contains(&name) {
             return Err(format!("duplicate local binding '{name}'"));
@@ -381,8 +423,49 @@ impl BodyParser<'_> {
         }
         self.local_names.push(name);
         self.local_types.push(value_type);
-        Ok(Statement::Let {
-            value_type,
+        self.local_mutability.push(mutable);
+        if mutable {
+            Ok(Statement::LetMutable {
+                value_type,
+                expression,
+            })
+        } else {
+            Ok(Statement::Let {
+                value_type,
+                expression,
+            })
+        }
+    }
+
+    fn parse_local_assignment(&mut self) -> Result<Statement, String> {
+        let name = self.parse_identifier()?;
+        let Some(local) = self
+            .local_names
+            .iter()
+            .position(|candidate| candidate == &name)
+        else {
+            if self.parameter_names.contains(&name.as_str()) {
+                return Err(format!("parameter '{name}' is immutable"));
+            }
+            return Err(format!("unknown local binding '{name}'"));
+        };
+        if !self.local_mutability[local] {
+            return Err(format!("local binding '{name}' is immutable"));
+        }
+        self.skip_whitespace();
+        self.expect_byte(b'=', "expected '=' in local assignment")?;
+        let expression_source = self.take_expression_until(b';')?.to_owned();
+        let (expression, expression_type) = self.compile_expression(&expression_source)?;
+        let value_type = self.local_types[local];
+        if expression_type != value_type {
+            return Err(format!(
+                "local binding '{name}' has type {}, expression has type {}",
+                value_type.name(),
+                expression_type.name()
+            ));
+        }
+        Ok(Statement::SetLocal {
+            local: local as u16,
             expression,
         })
     }
@@ -483,6 +566,66 @@ impl BodyParser<'_> {
         })
     }
 
+    fn parse_transfer(&mut self) -> Result<Statement, String> {
+        self.skip_whitespace();
+        self.expect_byte(b'(', "expected '(' after transfer_native")?;
+        let recipient_source = self.take_expression_until(b',')?.to_owned();
+        let (recipient, recipient_type) = self.compile_expression(&recipient_source)?;
+        if recipient_type != ValueType::Address {
+            return Err(format!(
+                "transfer recipient has type {}, expected address",
+                recipient_type.name()
+            ));
+        }
+        let amount_source = self.take_expression_until(b')')?.to_owned();
+        let (amount, amount_type) = self.compile_expression(&amount_source)?;
+        if amount_type != ValueType::U256 {
+            return Err(format!(
+                "transfer amount has type {}, expected u256",
+                amount_type.name()
+            ));
+        }
+        self.skip_whitespace();
+        self.expect_byte(b';', "expected ';' after transfer_native")?;
+        Ok(Statement::Transfer { recipient, amount })
+    }
+
+    fn parse_call(&mut self) -> Result<Statement, String> {
+        self.skip_whitespace();
+        self.expect_byte(b'(', "expected '(' after call_contract")?;
+        let target_source = self.take_expression_until(b',')?.to_owned();
+        let (target, target_type) = self.compile_expression(&target_source)?;
+        if target_type != ValueType::Address {
+            return Err(format!(
+                "contract call target has type {}, expected address",
+                target_type.name()
+            ));
+        }
+        let selector_source = self.take_expression_until(b',')?.to_owned();
+        let (selector, selector_type) = self.compile_expression(&selector_source)?;
+        if selector_type != ValueType::Bytes32 {
+            return Err(format!(
+                "contract call selector has type {}, expected bytes32",
+                selector_type.name()
+            ));
+        }
+        let value_source = self.take_expression_until(b')')?.to_owned();
+        let (value, value_type) = self.compile_expression(&value_source)?;
+        if value_type != ValueType::U256 {
+            return Err(format!(
+                "contract call value has type {}, expected u256",
+                value_type.name()
+            ));
+        }
+        self.skip_whitespace();
+        self.expect_byte(b';', "expected ';' after call_contract")?;
+        Ok(Statement::Call {
+            target,
+            selector,
+            value,
+        })
+    }
+
     fn parse_if(&mut self, depth: usize) -> Result<Statement, String> {
         let condition_source = self.take_expression_until(b'{')?.to_owned();
         let (condition, condition_type) = self.compile_expression(&condition_source)?;
@@ -494,9 +637,10 @@ impl BodyParser<'_> {
         }
 
         let inherited_local_count = self.local_names.len();
-        let then_branch = self.parse_block(true, depth + 1)?;
+        let then_branch = self.parse_block(true, depth + 1, true)?;
         self.local_names.truncate(inherited_local_count);
         self.local_types.truncate(inherited_local_count);
+        self.local_mutability.truncate(inherited_local_count);
 
         self.skip_whitespace();
         if !self.consume_keyword("else") {
@@ -504,14 +648,32 @@ impl BodyParser<'_> {
         }
         self.skip_whitespace();
         self.expect_byte(b'{', "expected '{' after else")?;
-        let else_branch = self.parse_block(true, depth + 1)?;
+        let else_branch = self.parse_block(true, depth + 1, true)?;
         self.local_names.truncate(inherited_local_count);
         self.local_types.truncate(inherited_local_count);
+        self.local_mutability.truncate(inherited_local_count);
         Ok(Statement::If {
             condition,
             then_branch,
             else_branch,
         })
+    }
+
+    fn parse_repeat(&mut self, depth: usize) -> Result<Statement, String> {
+        let count_source = self.take_expression_until(b'{')?.to_owned();
+        let (count, count_type) = self.compile_expression(&count_source)?;
+        if count_type != ValueType::U64 {
+            return Err(format!(
+                "repeat count has type {}, expected u64",
+                count_type.name()
+            ));
+        }
+        let inherited_local_count = self.local_names.len();
+        let body = self.parse_block(true, depth + 1, false)?;
+        self.local_names.truncate(inherited_local_count);
+        self.local_types.truncate(inherited_local_count);
+        self.local_mutability.truncate(inherited_local_count);
+        Ok(Statement::Repeat { count, body })
     }
 
     fn compile_expression(&self, source: &str) -> Result<(Vec<Instruction>, ValueType), String> {
@@ -521,6 +683,7 @@ impl BodyParser<'_> {
             self.parameter_types,
             &self.local_names,
             &self.local_types,
+            self.constants,
             self.storage,
         )?
         .parse()
@@ -532,12 +695,6 @@ impl BodyParser<'_> {
         let mut parentheses = 0usize;
         while let Some(byte) = self.peek_byte() {
             match byte {
-                b'(' => parentheses += 1,
-                b')' => {
-                    parentheses = parentheses
-                        .checked_sub(1)
-                        .ok_or_else(|| "unmatched ')' in expression".to_string())?;
-                }
                 value if value == terminator && parentheses == 0 => {
                     let expression = self.source[start..self.position].trim();
                     self.position += 1;
@@ -545,6 +702,12 @@ impl BodyParser<'_> {
                         return Err("expected expression".to_string());
                     }
                     return Ok(expression);
+                }
+                b'(' => parentheses += 1,
+                b')' => {
+                    parentheses = parentheses
+                        .checked_sub(1)
+                        .ok_or_else(|| "unmatched ')' in expression".to_string())?;
                 }
                 _ => {}
             }
@@ -621,17 +784,13 @@ impl BodyParser<'_> {
     fn peek_byte(&self) -> Option<u8> {
         self.source.as_bytes().get(self.position).copied()
     }
-
-    fn preview(&self) -> &str {
-        let end = self.source.len().min(self.position + 24);
-        &self.source[self.position..end]
-    }
 }
 
 fn parse_return(
     function: &lithic_syntax::FuncDecl,
     return_type: ValueType,
     parameter_types: &[ValueType],
+    constants: &[CompiledConstant],
     storage: &[StorageField],
 ) -> Result<ReturnValue, String> {
     let body = function.body_src.trim();
@@ -658,6 +817,17 @@ fn parse_return(
         }
         return Ok(ReturnValue::Parameter(index as u16));
     }
+    if let Some(constant) = constants.iter().find(|constant| constant.name == value) {
+        if constant.value_type != return_type {
+            return Err(format!(
+                "constant '{}' has type {}, expected {}",
+                value,
+                constant.value_type.name(),
+                return_type.name()
+            ));
+        }
+        return Ok(ReturnValue::Constant(constant.word));
+    }
     if let Ok(constant) = parse_constant(value, return_type) {
         return Ok(ReturnValue::Constant(constant));
     }
@@ -671,6 +841,7 @@ fn parse_return(
         parameter_types,
         &[],
         &[],
+        constants,
         storage,
     )?
     .parse()?;
@@ -699,6 +870,32 @@ fn parse_constant(value: &str, value_type: ValueType) -> Result<[u8; 32], String
             .map_err(|_| "u64 return must be an unsigned decimal literal".to_string()),
         ValueType::U256 => parse_u256_decimal(value),
     }
+}
+
+fn compile_constant_value(value: &str, value_type: ValueType) -> Result<[u8; 32], String> {
+    if value_type == ValueType::Bytes32 {
+        if let Some(argument) = value
+            .strip_prefix("keccak256(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            let text = argument
+                .trim()
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .ok_or_else(|| "keccak256 constant requires one string literal".to_string())?;
+            if text.contains('"') || text.contains('\\') {
+                return Err(
+                    "keccak256 constant string cannot contain quotes or escape sequences"
+                        .to_string(),
+                );
+            }
+            let digest = Keccak256::digest(text.as_bytes());
+            let mut word = [0; 32];
+            word.copy_from_slice(&digest);
+            return Ok(word);
+        }
+    }
+    parse_constant(value, value_type)
 }
 
 fn parse_fixed_hex(value: &str, width: usize) -> Result<[u8; 32], String> {
@@ -763,6 +960,7 @@ struct ExpressionParser<'a> {
     parameter_types: &'a [ValueType],
     local_names: &'a [String],
     local_types: &'a [ValueType],
+    constants: &'a [CompiledConstant],
     storage: &'a [StorageField],
 }
 
@@ -773,6 +971,7 @@ impl<'a> ExpressionParser<'a> {
         parameter_types: &'a [ValueType],
         local_names: &'a [String],
         local_types: &'a [ValueType],
+        constants: &'a [CompiledConstant],
         storage: &'a [StorageField],
     ) -> Result<Self, String> {
         Ok(Self {
@@ -783,6 +982,7 @@ impl<'a> ExpressionParser<'a> {
             parameter_types,
             local_names,
             local_types,
+            constants,
             storage,
         })
     }
@@ -919,6 +1119,12 @@ impl<'a> ExpressionParser<'a> {
                     return Ok((
                         vec![Instruction::Local(index as u16)],
                         self.local_types[index],
+                    ));
+                }
+                if let Some(constant) = self.constants.iter().find(|value| value.name == name) {
+                    return Ok((
+                        vec![Instruction::Constant(constant.value_type, constant.word)],
+                        constant.value_type,
                     ));
                 }
                 Err(format!("unknown expression identifier '{name}'"))
@@ -1060,6 +1266,12 @@ mod tests {
     use super::*;
     use lithovm::{ExecutionContext, Storage, Vm, BASE_CALL_GAS, PARAMETER_GAS};
 
+    fn word_from_bool(value: bool) -> [u8; 32] {
+        let mut word = [0; 32];
+        word[31] = u8::from(value);
+        word
+    }
+
     #[test]
     fn compiler_and_native_runtime_execute_the_same_artifact() {
         let artifact = compile(
@@ -1180,8 +1392,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v5");
-        assert_eq!(artifact.bytecode_version, 5);
+        assert_eq!(artifact.target, "lithovm-native-v9");
+        assert_eq!(artifact.bytecode_version, 9);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1236,10 +1448,6 @@ mod tests {
             (
                 "contract C { pub fn x(value: u64) -> u64 { if value { return 1; } else { return 2; } } }",
                 "if condition has type u64",
-            ),
-            (
-                "contract C { pub fn x(value: u64) -> u64 { let mut next = value; return next; } }",
-                "mutable local bindings",
             ),
         ] {
             assert!(
@@ -1325,6 +1533,8 @@ mod tests {
             block_height: 91,
             block_timestamp: 1_725_000_000,
             chain_id: 9005,
+            contract_balance: [0; 32],
+            call_depth: 0,
         };
         let vm = Vm::default();
 
@@ -1416,6 +1626,337 @@ mod tests {
             (
                 "contract C { event Seen { value: u64, account: address } pub fn x() -> u64 { emit Seen { account: 0x0000000000000000000000000000000000000000, value: 1 }; return 1; } }",
                 "expected field 'value'",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_transfers_are_staged_and_balance_checked() {
+        let artifact = compile(
+            "contract Payout { pub fn pay(to: address, amount: u256) -> u256 { transfer_native(to, amount); return amount; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let mut recipient = [0; 32];
+        recipient[12..].copy_from_slice(&[3; 20]);
+        let context = ExecutionContext {
+            contract_balance: word_from_u64(100),
+            chain_id: 9005,
+            ..ExecutionContext::default()
+        };
+        let vm = Vm::default();
+
+        assert!(vm
+            .execute(&bytes, "pay", &[recipient, word_from_u64(40)], 100,)
+            .is_err());
+        let result = vm
+            .execute_with_context(
+                &bytes,
+                "pay",
+                &[recipient, word_from_u64(40)],
+                100,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(result.transfers.len(), 1);
+        assert_eq!(result.transfers[0].recipient, recipient);
+        assert_eq!(result.transfers[0].amount, word_from_u64(40));
+
+        assert!(vm
+            .execute_with_context(
+                &bytes,
+                "pay",
+                &[recipient, word_from_u64(101)],
+                100,
+                &context,
+            )
+            .is_err());
+
+        let twice = compile(
+            "contract Payout { pub fn pay(to: address, first: u256, second: u256) -> u256 { transfer_native(to, first); transfer_native(to, second); return second; } }",
+        )
+        .unwrap();
+        let twice_bytes = hex::decode(&twice.bytecode[2..]).unwrap();
+        assert!(vm
+            .execute_with_context(
+                &twice_bytes,
+                "pay",
+                &[recipient, word_from_u64(60), word_from_u64(41)],
+                200,
+                &context,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn native_transfer_types_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(to: u64, amount: u256) -> u256 { transfer_native(to, amount); return amount; } }",
+                "recipient has type u64",
+            ),
+            (
+                "contract C { pub fn x(to: address, amount: u64) -> u64 { transfer_native(to, amount); return amount; } }",
+                "amount has type u64",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_calls_are_staged_with_depth_and_balance_limits() {
+        let artifact = compile(
+            "contract Caller { pub fn invoke(target: address, selector: bytes32, value: u256) -> u256 { call_contract(target, selector, value); return value; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let mut target = [0; 32];
+        target[12..].copy_from_slice(&[4; 20]);
+        let selector = [7; 32];
+        let context = ExecutionContext {
+            contract_balance: word_from_u64(100),
+            call_depth: 4,
+            chain_id: 9005,
+            ..ExecutionContext::default()
+        };
+        let vm = Vm::default();
+
+        let result = vm
+            .execute_with_context(
+                &bytes,
+                "invoke",
+                &[target, selector, word_from_u64(30)],
+                200,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].target, target);
+        assert_eq!(result.calls[0].selector, selector);
+        assert_eq!(result.calls[0].value, word_from_u64(30));
+        assert_eq!(result.calls[0].depth, 5);
+
+        let depth_limited = ExecutionContext {
+            call_depth: lithovm::MAX_CALL_DEPTH,
+            ..context.clone()
+        };
+        assert!(vm
+            .execute_with_context(
+                &bytes,
+                "invoke",
+                &[target, selector, word_from_u64(1)],
+                200,
+                &depth_limited,
+            )
+            .is_err());
+        assert!(vm
+            .execute_with_context(
+                &bytes,
+                "invoke",
+                &[target, selector, word_from_u64(101)],
+                200,
+                &context,
+            )
+            .is_err());
+
+        let mixed = compile(
+            "contract Caller { pub fn invoke(recipient: address, target: address, selector: bytes32, transfer_value: u256, call_value: u256) -> u256 { transfer_native(recipient, transfer_value); call_contract(target, selector, call_value); return call_value; } }",
+        )
+        .unwrap();
+        let mixed_bytes = hex::decode(&mixed.bytecode[2..]).unwrap();
+        let result = vm
+            .execute_with_context(
+                &mixed_bytes,
+                "invoke",
+                &[
+                    target,
+                    target,
+                    selector,
+                    word_from_u64(60),
+                    word_from_u64(40),
+                ],
+                300,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(result.transfers.len(), 1);
+        assert_eq!(result.calls.len(), 1);
+        assert!(vm
+            .execute_with_context(
+                &mixed_bytes,
+                "invoke",
+                &[
+                    target,
+                    target,
+                    selector,
+                    word_from_u64(60),
+                    word_from_u64(41),
+                ],
+                300,
+                &context,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn contract_call_types_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(target: u64, selector: bytes32, value: u256) -> u256 { call_contract(target, selector, value); return value; } }",
+                "target has type u64",
+            ),
+            (
+                "contract C { pub fn x(target: address, selector: u64, value: u256) -> u256 { call_contract(target, selector, value); return value; } }",
+                "selector has type u64",
+            ),
+            (
+                "contract C { pub fn x(target: address, selector: bytes32, value: u64) -> u64 { call_contract(target, selector, value); return value; } }",
+                "value has type u64",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_locals_execute_with_checked_assignment() {
+        let artifact = compile(
+            "contract Counter { pub fn increment(value: u64, enabled: bool) -> u64 { let mut current: u64 = value; if enabled { current = current + 1; return current; } else { return current; } } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        let enabled = vm
+            .execute(
+                &bytes,
+                "increment",
+                &[word_from_u64(41), word_from_bool(true)],
+                200,
+            )
+            .unwrap();
+        assert_eq!(enabled.return_value, word_from_u64(42));
+        let disabled = vm
+            .execute(
+                &bytes,
+                "increment",
+                &[word_from_u64(41), word_from_bool(false)],
+                200,
+            )
+            .unwrap();
+        assert_eq!(disabled.return_value, word_from_u64(41));
+    }
+
+    #[test]
+    fn local_assignment_fails_closed() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(value: u64) -> u64 { let current = value; current = current + 1; return current; } }",
+                "local binding 'current' is immutable",
+            ),
+            (
+                "contract C { pub fn x(value: u64) -> u64 { value = value + 1; return value; } }",
+                "parameter 'value' is immutable",
+            ),
+            (
+                "contract C { pub fn x(value: u64, replacement: bool) -> u64 { let mut current = value; current = replacement; return current; } }",
+                "local binding 'current' has type u64, expression has type bool",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_repeat_loops_execute_and_meter_each_iteration() {
+        let artifact = compile(
+            "contract Counter { pub fn count(iterations: u64) -> u64 { let mut current: u64 = 0; repeat iterations { current = current + 1; } return current; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        assert_eq!(
+            vm.execute(&bytes, "count", &[word_from_u64(5)], 200)
+                .unwrap()
+                .return_value,
+            word_from_u64(5)
+        );
+        assert_eq!(
+            vm.execute(&bytes, "count", &[word_from_u64(0)], 200)
+                .unwrap()
+                .return_value,
+            word_from_u64(0)
+        );
+        assert!(vm
+            .execute(
+                &bytes,
+                "count",
+                &[word_from_u64(lithovm::MAX_LOOP_ITERATIONS + 1)],
+                10_000,
+            )
+            .is_err());
+        assert!(vm
+            .execute(&bytes, "count", &[word_from_u64(5)], 10)
+            .is_err());
+    }
+
+    #[test]
+    fn repeat_loop_types_fail_closed() {
+        assert!(compile(
+            "contract C { pub fn x(enabled: bool) -> u64 { let mut current = 0; repeat enabled { current = current + 1; } return current; } }"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("repeat count has type bool"));
+    }
+
+    #[test]
+    fn typed_contract_constants_lower_into_existing_instructions() {
+        let artifact = compile(
+            "contract Roles { const LIMIT: u64 = 41; const ADMIN_ROLE: bytes32 = keccak256(\"ADMIN_ROLE\"); pub fn limit() -> u64 { return LIMIT + 1; } pub fn role() -> bytes32 { return ADMIN_ROLE; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        assert_eq!(
+            vm.execute(&bytes, "limit", &[], 100).unwrap().return_value,
+            word_from_u64(42)
+        );
+        let digest = Keccak256::digest(b"ADMIN_ROLE");
+        assert_eq!(
+            vm.execute(&bytes, "role", &[], 100).unwrap().return_value,
+            digest.as_slice()
+        );
+    }
+
+    #[test]
+    fn invalid_contract_constants_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { const BAD: bytes32 = keccak256(ADMIN_ROLE); pub fn x() -> bytes32 { return BAD; } }",
+                "keccak256 constant requires one string literal",
+            ),
+            (
+                "contract C { const FLAG: bool = 2; pub fn x() -> bool { return FLAG; } }",
+                "bool return must be true or false",
+            ),
+            (
+                "contract C { const FLAG: bool = true; pub fn x() -> u64 { return FLAG; } }",
+                "constant 'FLAG' has type bool, expected u64",
             ),
         ] {
             assert!(
