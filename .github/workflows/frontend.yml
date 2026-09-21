@@ -24,5 +24,6 @@ jobs:
       - run: cargo +1.96.0 run --locked -p lithc -- --emit lithovm apps/examples/frontend/lithovm-context.lithic
       - run: cargo +1.96.0 run --locked -p lithc -- --emit lithovm apps/examples/frontend/lithovm-events.lithic
       - run: cargo +1.96.0 run --locked -p lithc -- --emit lithovm apps/examples/frontend/lithovm-transfer.lithic
+      - run: cargo +1.96.0 run --locked -p lithc -- --emit lithovm apps/examples/frontend/lithovm-call.lithic
       - run: cargo +1.96.0 run --locked -p lithfmt -- --check apps/examples/frontend/hello.lithic
       - run: cargo +1.96.0 run --locked -p lithlint -- --deny-warnings apps/examples/frontend/hello.lithic

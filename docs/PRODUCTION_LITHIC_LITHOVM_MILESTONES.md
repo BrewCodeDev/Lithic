@@ -35,13 +35,13 @@ Status: scalar storage implemented in the version 3 candidate
 
 ## M4 — Host effects and gas
 
-Status: context, events and staged native transfers implemented through version 6
+Status: context, events, staged native transfers and outbound call intents implemented through version 7
 
 - caller, value, block and chain context implemented behind explicit runtime APIs;
 - typed ordered event schemas and successful-call event records implemented;
 - balance-checked staged native transfers implemented;
-- remaining contract calls;
-- reentrancy and call-depth policy;
+- balance-checked staged outbound call intents and a depth limit implemented;
+- remaining synchronous host execution, return data and reentrancy policy;
 - context opcodes use the current versioned instruction gas schedule; host-call gas remains;
 - deterministic receipts and observable failure semantics.
 

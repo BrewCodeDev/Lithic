@@ -2,7 +2,7 @@
 
 Status: implementation candidate; stateless typed statements
 
-Superseded for new compiler output by version 6. Runtime decoding remains
+Superseded for new compiler output by version 7. Runtime decoding remains
 supported for compatibility.
 
 Target identifier: `lithovm-native-v2`

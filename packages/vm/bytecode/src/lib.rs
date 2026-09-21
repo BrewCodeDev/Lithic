@@ -6,7 +6,8 @@ pub const STATEMENT_VERSION: u8 = 2;
 pub const STORAGE_VERSION: u8 = 3;
 pub const CONTEXT_VERSION: u8 = 4;
 pub const EVENT_VERSION: u8 = 5;
-pub const VERSION: u8 = 6;
+pub const TRANSFER_VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 pub const MAX_FUNCTIONS: usize = 1024;
 pub const MAX_PARAMETERS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 255;
@@ -76,6 +77,11 @@ pub enum Statement {
     Transfer {
         recipient: Vec<Instruction>,
         amount: Vec<Instruction>,
+    },
+    Call {
+        target: Vec<Instruction>,
+        selector: Vec<Instruction>,
+        value: Vec<Instruction>,
     },
     If {
         condition: Vec<Instruction>,
@@ -494,6 +500,16 @@ fn encode_statements(bytes: &mut Vec<u8>, statements: &[Statement]) -> Result<()
                 encode_expression(bytes, recipient)?;
                 encode_expression(bytes, amount)?;
             }
+            Statement::Call {
+                target,
+                selector,
+                value,
+            } => {
+                bytes.push(7);
+                encode_expression(bytes, target)?;
+                encode_expression(bytes, selector)?;
+                encode_expression(bytes, value)?;
+            }
             Statement::If {
                 condition,
                 then_branch,
@@ -618,9 +634,14 @@ fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Resu
                 }
                 Statement::Emit { event, values }
             }
-            6 if version >= VERSION => Statement::Transfer {
+            6 if version >= TRANSFER_VERSION => Statement::Transfer {
                 recipient: decode_expression(reader, version)?,
                 amount: decode_expression(reader, version)?,
+            },
+            7 if version >= VERSION => Statement::Call {
+                target: decode_expression(reader, version)?,
+                selector: decode_expression(reader, version)?,
+                value: decode_expression(reader, version)?,
             },
             opcode => bail!("unknown LithoVM statement opcode {opcode}"),
         });
@@ -759,6 +780,15 @@ fn validate_statements(
             Statement::Transfer { recipient, amount } => {
                 validate_expression(recipient, parameters, &locals, storage, ValueType::Address)?;
                 validate_expression(amount, parameters, &locals, storage, ValueType::U256)?;
+            }
+            Statement::Call {
+                target,
+                selector,
+                value,
+            } => {
+                validate_expression(target, parameters, &locals, storage, ValueType::Address)?;
+                validate_expression(selector, parameters, &locals, storage, ValueType::Bytes32)?;
+                validate_expression(value, parameters, &locals, storage, ValueType::U256)?;
             }
             Statement::If {
                 condition,
@@ -1029,6 +1059,9 @@ mod tests {
         let mut v5 = sample().encode().unwrap();
         v5[MAGIC.len()] = EVENT_VERSION;
         assert_eq!(parse(&v5).unwrap(), sample());
+        let mut v6 = sample().encode().unwrap();
+        v6[MAGIC.len()] = TRANSFER_VERSION;
+        assert_eq!(parse(&v6).unwrap(), sample());
     }
 
     #[test]
@@ -1157,5 +1190,31 @@ mod tests {
         let mut mislabeled_v5 = bytes;
         mislabeled_v5[MAGIC.len()] = EVENT_VERSION;
         assert!(parse(&mislabeled_v5).is_err());
+    }
+
+    #[test]
+    fn contract_call_statement_round_trips_with_static_types() {
+        let program = Program {
+            storage: vec![],
+            events: vec![],
+            functions: vec![Function {
+                name: "invoke".into(),
+                parameters: vec![ValueType::Address, ValueType::Bytes32, ValueType::U256],
+                return_type: ValueType::U256,
+                return_value: ReturnValue::Statements(vec![
+                    Statement::Call {
+                        target: vec![Instruction::Parameter(0)],
+                        selector: vec![Instruction::Parameter(1)],
+                        value: vec![Instruction::Parameter(2)],
+                    },
+                    Statement::Return(vec![Instruction::Parameter(2)]),
+                ]),
+            }],
+        };
+        let bytes = program.encode().unwrap();
+        assert_eq!(parse(&bytes).unwrap(), program);
+        let mut mislabeled_v6 = bytes;
+        mislabeled_v6[MAGIC.len()] = TRANSFER_VERSION;
+        assert!(parse(&mislabeled_v6).is_err());
     }
 }

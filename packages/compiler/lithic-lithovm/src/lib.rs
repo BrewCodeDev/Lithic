@@ -12,7 +12,7 @@ use lithovm_bytecode::{
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v6";
+pub const TARGET: &str = "lithovm-native-v7";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,7 +131,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     for item in &contract.items {
         match item {
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v6".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v7".to_string(),
             ),
             Item::Event(_) => {}
             Item::Func(function) => match compile_function(function, &storage, &events) {
@@ -221,7 +221,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v6 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v7 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -234,7 +234,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v6 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v7 lowering")),
     }
 }
 
@@ -250,6 +250,7 @@ fn parse_body(
         && !starts_with_keyword(body, "if")
         && !starts_with_keyword(body, "emit")
         && !body.starts_with("transfer_native(")
+        && !body.starts_with("call_contract(")
         && !body.starts_with("self.")
     {
         return parse_return(function, return_type, parameter_types, storage);
@@ -338,6 +339,8 @@ impl BodyParser<'_> {
                 self.parse_emit()?
             } else if self.consume_keyword("transfer_native") {
                 self.parse_transfer()?
+            } else if self.consume_keyword("call_contract") {
+                self.parse_call()?
             } else if self.consume_self_prefix() {
                 self.parse_store()?
             } else {
@@ -508,6 +511,42 @@ impl BodyParser<'_> {
         self.skip_whitespace();
         self.expect_byte(b';', "expected ';' after transfer_native")?;
         Ok(Statement::Transfer { recipient, amount })
+    }
+
+    fn parse_call(&mut self) -> Result<Statement, String> {
+        self.skip_whitespace();
+        self.expect_byte(b'(', "expected '(' after call_contract")?;
+        let target_source = self.take_expression_until(b',')?.to_owned();
+        let (target, target_type) = self.compile_expression(&target_source)?;
+        if target_type != ValueType::Address {
+            return Err(format!(
+                "contract call target has type {}, expected address",
+                target_type.name()
+            ));
+        }
+        let selector_source = self.take_expression_until(b',')?.to_owned();
+        let (selector, selector_type) = self.compile_expression(&selector_source)?;
+        if selector_type != ValueType::Bytes32 {
+            return Err(format!(
+                "contract call selector has type {}, expected bytes32",
+                selector_type.name()
+            ));
+        }
+        let value_source = self.take_expression_until(b')')?.to_owned();
+        let (value, value_type) = self.compile_expression(&value_source)?;
+        if value_type != ValueType::U256 {
+            return Err(format!(
+                "contract call value has type {}, expected u256",
+                value_type.name()
+            ));
+        }
+        self.skip_whitespace();
+        self.expect_byte(b';', "expected ';' after call_contract")?;
+        Ok(Statement::Call {
+            target,
+            selector,
+            value,
+        })
     }
 
     fn parse_if(&mut self, depth: usize) -> Result<Statement, String> {
@@ -1207,8 +1246,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v6");
-        assert_eq!(artifact.bytecode_version, 6);
+        assert_eq!(artifact.target, "lithovm-native-v7");
+        assert_eq!(artifact.bytecode_version, 7);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1353,6 +1392,7 @@ mod tests {
             block_timestamp: 1_725_000_000,
             chain_id: 9005,
             contract_balance: [0; 32],
+            call_depth: 0,
         };
         let vm = Vm::default();
 
@@ -1521,6 +1561,124 @@ mod tests {
             (
                 "contract C { pub fn x(to: address, amount: u64) -> u64 { transfer_native(to, amount); return amount; } }",
                 "amount has type u64",
+            ),
+        ] {
+            assert!(
+                compile(source).unwrap_err().to_string().contains(expected),
+                "missing '{expected}' for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn contract_calls_are_staged_with_depth_and_balance_limits() {
+        let artifact = compile(
+            "contract Caller { pub fn invoke(target: address, selector: bytes32, value: u256) -> u256 { call_contract(target, selector, value); return value; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let mut target = [0; 32];
+        target[12..].copy_from_slice(&[4; 20]);
+        let selector = [7; 32];
+        let context = ExecutionContext {
+            contract_balance: word_from_u64(100),
+            call_depth: 4,
+            chain_id: 9005,
+            ..ExecutionContext::default()
+        };
+        let vm = Vm::default();
+
+        let result = vm
+            .execute_with_context(
+                &bytes,
+                "invoke",
+                &[target, selector, word_from_u64(30)],
+                200,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].target, target);
+        assert_eq!(result.calls[0].selector, selector);
+        assert_eq!(result.calls[0].value, word_from_u64(30));
+        assert_eq!(result.calls[0].depth, 5);
+
+        let depth_limited = ExecutionContext {
+            call_depth: lithovm::MAX_CALL_DEPTH,
+            ..context.clone()
+        };
+        assert!(vm
+            .execute_with_context(
+                &bytes,
+                "invoke",
+                &[target, selector, word_from_u64(1)],
+                200,
+                &depth_limited,
+            )
+            .is_err());
+        assert!(vm
+            .execute_with_context(
+                &bytes,
+                "invoke",
+                &[target, selector, word_from_u64(101)],
+                200,
+                &context,
+            )
+            .is_err());
+
+        let mixed = compile(
+            "contract Caller { pub fn invoke(recipient: address, target: address, selector: bytes32, transfer_value: u256, call_value: u256) -> u256 { transfer_native(recipient, transfer_value); call_contract(target, selector, call_value); return call_value; } }",
+        )
+        .unwrap();
+        let mixed_bytes = hex::decode(&mixed.bytecode[2..]).unwrap();
+        let result = vm
+            .execute_with_context(
+                &mixed_bytes,
+                "invoke",
+                &[
+                    target,
+                    target,
+                    selector,
+                    word_from_u64(60),
+                    word_from_u64(40),
+                ],
+                300,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(result.transfers.len(), 1);
+        assert_eq!(result.calls.len(), 1);
+        assert!(vm
+            .execute_with_context(
+                &mixed_bytes,
+                "invoke",
+                &[
+                    target,
+                    target,
+                    selector,
+                    word_from_u64(60),
+                    word_from_u64(41),
+                ],
+                300,
+                &context,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn contract_call_types_fail_closed() {
+        for (source, expected) in [
+            (
+                "contract C { pub fn x(target: u64, selector: bytes32, value: u256) -> u256 { call_contract(target, selector, value); return value; } }",
+                "target has type u64",
+            ),
+            (
+                "contract C { pub fn x(target: address, selector: u64, value: u256) -> u256 { call_contract(target, selector, value); return value; } }",
+                "selector has type u64",
+            ),
+            (
+                "contract C { pub fn x(target: address, selector: bytes32, value: u64) -> u64 { call_contract(target, selector, value); return value; } }",
+                "value has type u64",
             ),
         ] {
             assert!(

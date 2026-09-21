@@ -18,6 +18,7 @@ pub struct ExecutionResult {
     pub gas_used: u64,
     pub events: Vec<EventRecord>,
     pub transfers: Vec<NativeTransfer>,
+    pub calls: Vec<ContractCall>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,14 @@ pub struct NativeTransfer {
     pub amount: [u8; 32],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContractCall {
+    pub target: [u8; 32],
+    pub selector: [u8; 32],
+    pub value: [u8; 32],
+    pub depth: u16,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionContext {
     pub caller: [u8; 32],
@@ -40,6 +49,7 @@ pub struct ExecutionContext {
     pub block_timestamp: u64,
     pub chain_id: u64,
     pub contract_balance: [u8; 32],
+    pub call_depth: u16,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -61,6 +71,8 @@ pub const BASE_CALL_GAS: u64 = 10;
 pub const PARAMETER_GAS: u64 = 2;
 pub const INSTRUCTION_GAS: u64 = 1;
 pub const NATIVE_TRANSFER_GAS: u64 = 20;
+pub const CONTRACT_CALL_GAS: u64 = 40;
+pub const MAX_CALL_DEPTH: u16 = 32;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -231,6 +243,7 @@ fn execute_program(
         context,
         events: Vec::new(),
         transfers: Vec::new(),
+        calls: Vec::new(),
         remaining_balance: context.map_or([0; 32], |value| value.contract_balance),
     };
     let return_value = match &function.return_value {
@@ -264,6 +277,7 @@ fn execute_program(
         gas_used,
         events: environment.events,
         transfers: environment.transfers,
+        calls: environment.calls,
     })
 }
 
@@ -273,7 +287,11 @@ fn validate_context(context: &ExecutionContext) -> Result<()> {
     validate_word(ValueType::U256, &context.value)
         .map_err(|error| anyhow!("execution context value: {error}"))?;
     validate_word(ValueType::U256, &context.contract_balance)
-        .map_err(|error| anyhow!("execution context contract balance: {error}"))
+        .map_err(|error| anyhow!("execution context contract balance: {error}"))?;
+    if context.call_depth > MAX_CALL_DEPTH {
+        bail!("execution context call depth exceeds {MAX_CALL_DEPTH}");
+    }
+    Ok(())
 }
 
 fn prepare_storage(program: &Program, storage: &mut Storage) -> Result<()> {
@@ -303,6 +321,7 @@ struct RuntimeEnvironment<'a> {
     context: Option<&'a ExecutionContext>,
     events: Vec<EventRecord>,
     transfers: Vec<NativeTransfer>,
+    calls: Vec<ContractCall>,
     remaining_balance: [u8; 32],
 }
 
@@ -325,6 +344,7 @@ fn execute_expression(
         gas_used,
         events: Vec::new(),
         transfers: Vec::new(),
+        calls: Vec::new(),
     })
 }
 
@@ -510,6 +530,7 @@ fn execute_statements(
         gas_used: meter.used,
         events: std::mem::take(&mut environment.events),
         transfers: std::mem::take(&mut environment.transfers),
+        calls: std::mem::take(&mut environment.calls),
     })
 }
 
@@ -625,6 +646,43 @@ fn execute_block(
                 environment.transfers.push(NativeTransfer {
                     recipient: recipient.word,
                     amount: amount.word,
+                });
+            }
+            Statement::Call {
+                target,
+                selector,
+                value,
+            } => {
+                meter.charge(CONTRACT_CALL_GAS)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(target.len() as u64))?;
+                let target =
+                    evaluate_expression(target, arguments, parameter_types, locals, environment)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(selector.len() as u64))?;
+                let selector =
+                    evaluate_expression(selector, arguments, parameter_types, locals, environment)?;
+                meter.charge(INSTRUCTION_GAS.saturating_mul(value.len() as u64))?;
+                let value =
+                    evaluate_expression(value, arguments, parameter_types, locals, environment)?;
+                if target.value_type != ValueType::Address
+                    || selector.value_type != ValueType::Bytes32
+                    || value.value_type != ValueType::U256
+                {
+                    bail!("contract call runtime type mismatch");
+                }
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contract call requires an execution context"))?;
+                if context.call_depth >= MAX_CALL_DEPTH {
+                    bail!("contract call depth limit reached");
+                }
+                environment.remaining_balance =
+                    subtract_u256(environment.remaining_balance, value.word)
+                        .ok_or_else(|| anyhow!("contract call value exceeds contract balance"))?;
+                environment.calls.push(ContractCall {
+                    target: target.word,
+                    selector: selector.word,
+                    value: value.word,
+                    depth: context.call_depth + 1,
                 });
             }
             Statement::If {
