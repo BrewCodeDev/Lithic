@@ -59,5 +59,5 @@ Version 2 adds immutable local bindings and structured control flow. Version 3
 adds transactional scalar storage. Version 4 adds explicit message, block and
 chain context. Version 5 adds typed events. Version 6 adds staged native
 transfers. Version 7 adds staged outbound contract-call intents. Version 8 adds
-typed mutable local bindings. Extensions must retain strict decoding and atomic
-failure.
+typed mutable local bindings. Version 9 adds gas-bounded repeat loops.
+Extensions must retain strict decoding and atomic failure.

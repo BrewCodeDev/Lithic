@@ -2,6 +2,9 @@
 
 Status: implementation candidate; typed mutable local bindings
 
+Superseded for new compiler output by version 9. Runtime decoding remains
+supported.
+
 Target identifier: `lithovm-native-v8`
 
 Version 8 extends version 7 with explicit mutable local declarations and typed

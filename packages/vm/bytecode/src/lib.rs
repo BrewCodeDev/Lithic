@@ -8,7 +8,8 @@ pub const CONTEXT_VERSION: u8 = 4;
 pub const EVENT_VERSION: u8 = 5;
 pub const TRANSFER_VERSION: u8 = 6;
 pub const CALL_VERSION: u8 = 7;
-pub const VERSION: u8 = 8;
+pub const MUTABLE_VERSION: u8 = 8;
+pub const VERSION: u8 = 9;
 pub const MAX_FUNCTIONS: usize = 1024;
 pub const MAX_PARAMETERS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 255;
@@ -73,6 +74,10 @@ pub enum Statement {
     SetLocal {
         local: u16,
         expression: Vec<Instruction>,
+    },
+    Repeat {
+        count: Vec<Instruction>,
+        body: Vec<Statement>,
     },
     Return(Vec<Instruction>),
     Store {
@@ -312,7 +317,7 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
             }
             4 if version >= STATEMENT_VERSION => {
                 let statements = decode_statements(&mut reader, version, 0)?;
-                validate_statements(
+                let terminal = validate_statements(
                     &statements,
                     &parameters,
                     return_type,
@@ -321,6 +326,9 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
                     &events,
                     0,
                 )?;
+                if !terminal {
+                    bail!("function does not return on every path");
+                }
                 ReturnValue::Statements(statements)
             }
             opcode => bail!("unknown LithoVM return opcode {opcode}"),
@@ -450,7 +458,7 @@ fn validate_functions(
                 )?;
             }
             ReturnValue::Statements(ref statements) => {
-                validate_statements(
+                let terminal = validate_statements(
                     statements,
                     &function.parameters,
                     function.return_type,
@@ -459,6 +467,9 @@ fn validate_functions(
                     events,
                     0,
                 )?;
+                if !terminal {
+                    bail!("function does not return on every path");
+                }
             }
         }
     }
@@ -499,6 +510,11 @@ fn encode_statements(bytes: &mut Vec<u8>, statements: &[Statement]) -> Result<()
                 bytes.push(9);
                 bytes.extend_from_slice(&local.to_be_bytes());
                 encode_expression(bytes, expression)?;
+            }
+            Statement::Repeat { count, body } => {
+                bytes.push(10);
+                encode_expression(bytes, count)?;
+                encode_statements(bytes, body)?;
             }
             Statement::Return(expression) => {
                 bytes.push(2);
@@ -634,13 +650,17 @@ fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Resu
                 value_type: ValueType::from_byte(reader.byte()?)?,
                 expression: decode_expression(reader, version)?,
             },
-            8 if version >= VERSION => Statement::LetMutable {
+            8 if version >= MUTABLE_VERSION => Statement::LetMutable {
                 value_type: ValueType::from_byte(reader.byte()?)?,
                 expression: decode_expression(reader, version)?,
             },
-            9 if version >= VERSION => Statement::SetLocal {
+            9 if version >= MUTABLE_VERSION => Statement::SetLocal {
                 local: reader.u16()?,
                 expression: decode_expression(reader, version)?,
+            },
+            10 if version >= VERSION => Statement::Repeat {
+                count: decode_expression(reader, version)?,
+                body: decode_statements(reader, version, depth + 1)?,
             },
             2 => Statement::Return(decode_expression(reader, version)?),
             3 => Statement::If {
@@ -758,7 +778,7 @@ fn validate_statements(
     storage: &[StorageField],
     events: &[EventDefinition],
     depth: usize,
-) -> Result<()> {
+) -> Result<bool> {
     if depth > MAX_BLOCK_DEPTH {
         bail!("LithoVM statement nesting exceeds {MAX_BLOCK_DEPTH}");
     }
@@ -803,6 +823,23 @@ fn validate_statements(
                     bail!("local assignment targets an immutable binding");
                 }
                 validate_expression(expression, parameters, &locals, storage, value_type)?;
+            }
+            Statement::Repeat { count, body } => {
+                validate_expression(count, parameters, &locals, storage, ValueType::U64)?;
+                let bindings = locals
+                    .iter()
+                    .copied()
+                    .zip(mutable.iter().copied())
+                    .collect::<Vec<_>>();
+                validate_statements(
+                    body,
+                    parameters,
+                    return_type,
+                    &bindings,
+                    storage,
+                    events,
+                    depth + 1,
+                )?;
             }
             Statement::Return(expression) => {
                 validate_expression(expression, parameters, &locals, storage, return_type)?;
@@ -853,7 +890,7 @@ fn validate_statements(
                     .copied()
                     .zip(mutable.iter().copied())
                     .collect::<Vec<_>>();
-                validate_statements(
+                let then_terminal = validate_statements(
                     then_branch,
                     parameters,
                     return_type,
@@ -862,7 +899,7 @@ fn validate_statements(
                     events,
                     depth + 1,
                 )?;
-                validate_statements(
+                let else_terminal = validate_statements(
                     else_branch,
                     parameters,
                     return_type,
@@ -871,14 +908,11 @@ fn validate_statements(
                     events,
                     depth + 1,
                 )?;
-                terminal = true;
+                terminal = then_terminal && else_terminal;
             }
         }
     }
-    if !terminal {
-        bail!("statement block does not return on every path");
-    }
-    Ok(())
+    Ok(terminal)
 }
 
 fn pop_expected(stack: &mut Vec<ValueType>, expected: ValueType) -> Result<()> {
@@ -1122,6 +1156,9 @@ mod tests {
         let mut v7 = sample().encode().unwrap();
         v7[MAGIC.len()] = CALL_VERSION;
         assert_eq!(parse(&v7).unwrap(), sample());
+        let mut v8 = sample().encode().unwrap();
+        v8[MAGIC.len()] = MUTABLE_VERSION;
+        assert_eq!(parse(&v8).unwrap(), sample());
     }
 
     #[test]
@@ -1322,6 +1359,56 @@ mod tests {
             value_type: ValueType::U64,
             expression: vec![Instruction::Parameter(0)],
         };
+        assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn repeat_statement_round_trips_and_requires_u64_count() {
+        let program = Program {
+            storage: vec![],
+            events: vec![],
+            functions: vec![Function {
+                name: "count".into(),
+                parameters: vec![ValueType::U64],
+                return_type: ValueType::U64,
+                return_value: ReturnValue::Statements(vec![
+                    Statement::LetMutable {
+                        value_type: ValueType::U64,
+                        expression: vec![Instruction::Constant(ValueType::U64, [0; 32])],
+                    },
+                    Statement::Repeat {
+                        count: vec![Instruction::Parameter(0)],
+                        body: vec![Statement::SetLocal {
+                            local: 0,
+                            expression: vec![
+                                Instruction::Local(0),
+                                Instruction::Constant(ValueType::U64, {
+                                    let mut word = [0; 32];
+                                    word[31] = 1;
+                                    word
+                                }),
+                                Instruction::AddU64,
+                            ],
+                        }],
+                    },
+                    Statement::Return(vec![Instruction::Local(0)]),
+                ]),
+            }],
+        };
+        let bytes = program.encode().unwrap();
+        assert_eq!(parse(&bytes).unwrap(), program);
+        let mut mislabeled_v8 = bytes;
+        mislabeled_v8[MAGIC.len()] = MUTABLE_VERSION;
+        assert!(parse(&mislabeled_v8).is_err());
+
+        let mut invalid = program;
+        let ReturnValue::Statements(statements) = &mut invalid.functions[0].return_value else {
+            unreachable!()
+        };
+        let Statement::Repeat { count, .. } = &mut statements[1] else {
+            unreachable!()
+        };
+        *count = vec![Instruction::Constant(ValueType::Bool, [0; 32])];
         assert!(invalid.encode().is_err());
     }
 }

@@ -2,7 +2,7 @@
 
 Status: implementation candidate; staged native-value transfers
 
-Superseded for new compiler output by version 8. Runtime decoding remains
+Superseded for new compiler output by version 9. Runtime decoding remains
 supported.
 
 Target identifier: `lithovm-native-v6`

@@ -73,6 +73,7 @@ pub const INSTRUCTION_GAS: u64 = 1;
 pub const NATIVE_TRANSFER_GAS: u64 = 20;
 pub const CONTRACT_CALL_GAS: u64 = 40;
 pub const MAX_CALL_DEPTH: u16 = 32;
+pub const MAX_LOOP_ITERATIONS: u64 = 1024;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -519,7 +520,8 @@ fn execute_statements(
         &mut locals,
         &mut meter,
         environment,
-    )?;
+    )?
+    .ok_or_else(|| anyhow!("statement block completed without returning"))?;
     if result.value_type != return_type {
         bail!("statement return type does not match function return type");
     }
@@ -541,7 +543,7 @@ fn execute_block(
     locals: &mut Vec<StackValue>,
     meter: &mut GasMeter,
     environment: &mut RuntimeEnvironment<'_>,
-) -> Result<StackValue> {
+) -> Result<Option<StackValue>> {
     for statement in statements {
         meter.charge(INSTRUCTION_GAS)?;
         match statement {
@@ -583,15 +585,42 @@ fn execute_block(
                 }
                 *binding = value;
             }
+            Statement::Repeat { count, body } => {
+                meter.charge(INSTRUCTION_GAS.saturating_mul(count.len() as u64))?;
+                let count =
+                    evaluate_expression(count, arguments, parameter_types, locals, environment)?;
+                if count.value_type != ValueType::U64 || count.word[..24] != [0; 24] {
+                    bail!("repeat count runtime type is not a canonical u64");
+                }
+                let count = u64::from_be_bytes(count.word[24..].try_into().unwrap());
+                if count > MAX_LOOP_ITERATIONS {
+                    bail!("repeat count exceeds {MAX_LOOP_ITERATIONS}");
+                }
+                let local_count = locals.len();
+                for _ in 0..count {
+                    let result = execute_block(
+                        body,
+                        arguments,
+                        parameter_types,
+                        locals,
+                        meter,
+                        environment,
+                    )?;
+                    locals.truncate(local_count);
+                    if result.is_some() {
+                        return Ok(result);
+                    }
+                }
+            }
             Statement::Return(expression) => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
-                return evaluate_expression(
+                return Ok(Some(evaluate_expression(
                     expression,
                     arguments,
                     parameter_types,
                     locals,
                     environment,
-                );
+                )?));
             }
             Statement::Store { field, expression } => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
@@ -737,13 +766,15 @@ fn execute_block(
                     locals,
                     meter,
                     environment,
-                );
+                )?;
                 locals.truncate(local_count);
-                return result;
+                if result.is_some() {
+                    return Ok(result);
+                }
             }
         }
     }
-    bail!("statement block completed without returning")
+    Ok(None)
 }
 
 fn binary_u64(

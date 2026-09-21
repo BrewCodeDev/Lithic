@@ -12,7 +12,7 @@ use lithovm_bytecode::{
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v8";
+pub const TARGET: &str = "lithovm-native-v9";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,7 +131,7 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     for item in &contract.items {
         match item {
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v8".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v9".to_string(),
             ),
             Item::Event(_) => {}
             Item::Func(function) => match compile_function(function, &storage, &events) {
@@ -221,7 +221,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v8 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v9 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -234,7 +234,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v8 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v9 lowering")),
     }
 }
 
@@ -267,7 +267,7 @@ fn parse_body(
         statement_count: 0,
         return_type,
     };
-    let statements = parser.parse_block(false, 0)?;
+    let statements = parser.parse_block(false, 0, true)?;
     Ok(ReturnValue::Statements(statements))
 }
 
@@ -293,7 +293,12 @@ struct BodyParser<'a> {
 }
 
 impl BodyParser<'_> {
-    fn parse_block(&mut self, nested: bool, depth: usize) -> Result<Vec<Statement>, String> {
+    fn parse_block(
+        &mut self,
+        nested: bool,
+        depth: usize,
+        require_return: bool,
+    ) -> Result<Vec<Statement>, String> {
         if depth > MAX_BLOCK_DEPTH {
             return Err(format!(
                 "statement nesting exceeds maximum depth {MAX_BLOCK_DEPTH}"
@@ -305,7 +310,7 @@ impl BodyParser<'_> {
             self.skip_whitespace();
             if nested && self.peek_byte() == Some(b'}') {
                 self.position += 1;
-                if !terminal {
+                if require_return && !terminal {
                     return Err("branch does not return on every path".to_string());
                 }
                 return Ok(statements);
@@ -314,7 +319,7 @@ impl BodyParser<'_> {
                 if nested {
                     return Err("unterminated statement block".to_string());
                 }
-                if !terminal {
+                if require_return && !terminal {
                     return Err("function does not return on every path".to_string());
                 }
                 return Ok(statements);
@@ -331,6 +336,8 @@ impl BodyParser<'_> {
             } else if self.consume_keyword("if") {
                 terminal = true;
                 self.parse_if(depth)?
+            } else if self.consume_keyword("repeat") {
+                self.parse_repeat(depth)?
             } else if self.consume_keyword("emit") {
                 self.parse_emit()?
             } else if self.consume_keyword("transfer_native") {
@@ -595,7 +602,7 @@ impl BodyParser<'_> {
         }
 
         let inherited_local_count = self.local_names.len();
-        let then_branch = self.parse_block(true, depth + 1)?;
+        let then_branch = self.parse_block(true, depth + 1, true)?;
         self.local_names.truncate(inherited_local_count);
         self.local_types.truncate(inherited_local_count);
         self.local_mutability.truncate(inherited_local_count);
@@ -606,7 +613,7 @@ impl BodyParser<'_> {
         }
         self.skip_whitespace();
         self.expect_byte(b'{', "expected '{' after else")?;
-        let else_branch = self.parse_block(true, depth + 1)?;
+        let else_branch = self.parse_block(true, depth + 1, true)?;
         self.local_names.truncate(inherited_local_count);
         self.local_types.truncate(inherited_local_count);
         self.local_mutability.truncate(inherited_local_count);
@@ -615,6 +622,23 @@ impl BodyParser<'_> {
             then_branch,
             else_branch,
         })
+    }
+
+    fn parse_repeat(&mut self, depth: usize) -> Result<Statement, String> {
+        let count_source = self.take_expression_until(b'{')?.to_owned();
+        let (count, count_type) = self.compile_expression(&count_source)?;
+        if count_type != ValueType::U64 {
+            return Err(format!(
+                "repeat count has type {}, expected u64",
+                count_type.name()
+            ));
+        }
+        let inherited_local_count = self.local_names.len();
+        let body = self.parse_block(true, depth + 1, false)?;
+        self.local_names.truncate(inherited_local_count);
+        self.local_types.truncate(inherited_local_count);
+        self.local_mutability.truncate(inherited_local_count);
+        Ok(Statement::Repeat { count, body })
     }
 
     fn compile_expression(&self, source: &str) -> Result<(Vec<Instruction>, ValueType), String> {
@@ -1284,8 +1308,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v8");
-        assert_eq!(artifact.bytecode_version, 8);
+        assert_eq!(artifact.target, "lithovm-native-v9");
+        assert_eq!(artifact.bytecode_version, 9);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1771,5 +1795,48 @@ mod tests {
                 "missing '{expected}' for {source}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_repeat_loops_execute_and_meter_each_iteration() {
+        let artifact = compile(
+            "contract Counter { pub fn count(iterations: u64) -> u64 { let mut current: u64 = 0; repeat iterations { current = current + 1; } return current; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        assert_eq!(
+            vm.execute(&bytes, "count", &[word_from_u64(5)], 200)
+                .unwrap()
+                .return_value,
+            word_from_u64(5)
+        );
+        assert_eq!(
+            vm.execute(&bytes, "count", &[word_from_u64(0)], 200)
+                .unwrap()
+                .return_value,
+            word_from_u64(0)
+        );
+        assert!(vm
+            .execute(
+                &bytes,
+                "count",
+                &[word_from_u64(lithovm::MAX_LOOP_ITERATIONS + 1)],
+                10_000,
+            )
+            .is_err());
+        assert!(vm
+            .execute(&bytes, "count", &[word_from_u64(5)], 10)
+            .is_err());
+    }
+
+    #[test]
+    fn repeat_loop_types_fail_closed() {
+        assert!(compile(
+            "contract C { pub fn x(enabled: bool) -> u64 { let mut current = 0; repeat enabled { current = current + 1; } return current; } }"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("repeat count has type bool"));
     }
 }
