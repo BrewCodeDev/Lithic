@@ -1,8 +1,8 @@
 //! Fail-closed Lithic-to-native-LithoVM backend.
 //!
-//! Version 1 deliberately starts with the same stateless static-value subset
-//! used to establish the compiler/runtime boundary. Unsupported declarations
-//! reject the whole compilation; no source behavior is silently discarded.
+//! The backend emits a versioned, strictly decoded native artifact. Unsupported
+//! declarations reject the whole compilation; no source behavior is silently
+//! discarded.
 
 use lithic_syntax::{Contract, Item, Type};
 use lithovm_bytecode::{
@@ -12,7 +12,7 @@ use lithovm_bytecode::{
 use serde::Serialize;
 use std::fmt;
 
-pub const TARGET: &str = "lithovm-native-v3";
+pub const TARGET: &str = "lithovm-native-v4";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,10 +101,10 @@ fn compile_contract(contract: &Contract) -> Result<Artifact, CompileError> {
     for item in &contract.items {
         match item {
             Item::Const(_) => errors.push(
-                "contract constants are not supported by native LithoVM bytecode v3".to_string(),
+                "contract constants are not supported by native LithoVM bytecode v4".to_string(),
             ),
             Item::Event(_) => errors.push(
-                "event declarations are not supported by native LithoVM bytecode v3".to_string(),
+                "event declarations are not supported by native LithoVM bytecode v4".to_string(),
             ),
             Item::Func(function) => match compile_function(function, &storage) {
                 Ok((compiled, entry)) => {
@@ -188,7 +188,7 @@ fn lower_type(value: &Type) -> Result<ValueType, String> {
             "bool" => Ok(ValueType::Bool),
             "address" => Ok(ValueType::Address),
             "bytes32" => Ok(ValueType::Bytes32),
-            other => Err(format!("type '{other}' has no native LithoVM v3 lowering")),
+            other => Err(format!("type '{other}' has no native LithoVM v4 lowering")),
         },
         Type::Map(_, _) | Type::Vec(_) => Err("collection types are unsupported".to_string()),
     }
@@ -201,7 +201,7 @@ fn lower_named_type(name: &str) -> Result<ValueType, String> {
         "bool" => Ok(ValueType::Bool),
         "address" => Ok(ValueType::Address),
         "bytes32" => Ok(ValueType::Bytes32),
-        other => Err(format!("type '{other}' has no native LithoVM v3 lowering")),
+        other => Err(format!("type '{other}' has no native LithoVM v4 lowering")),
     }
 }
 
@@ -787,6 +787,16 @@ impl<'a> ExpressionParser<'a> {
                 ValueType::Bool,
             )),
             ExprToken::Ident(name) => {
+                if let Some((instruction, value_type)) = match name.as_str() {
+                    "msg.sender" => Some((Instruction::MessageSender, ValueType::Address)),
+                    "msg.value" => Some((Instruction::MessageValue, ValueType::U256)),
+                    "block.height" => Some((Instruction::BlockHeight, ValueType::U64)),
+                    "block.timestamp" => Some((Instruction::BlockTimestamp, ValueType::U64)),
+                    "chain.id" => Some((Instruction::ChainId, ValueType::U64)),
+                    _ => None,
+                } {
+                    return Ok((vec![instruction], value_type));
+                }
                 if let Some(field_name) = name.strip_prefix("self.") {
                     let index = self
                         .storage
@@ -899,13 +909,13 @@ fn lex_expression(source: &str) -> Result<Vec<ExprToken>, String> {
             {
                 position += 1;
             }
-            if &source[start..position] == "self" && bytes.get(position) == Some(&b'.') {
+            if bytes.get(position) == Some(&b'.') {
                 position += 1;
                 let Some(first) = bytes.get(position) else {
-                    return Err("expected storage field after 'self.'".to_string());
+                    return Err("expected identifier after '.'".to_string());
                 };
                 if !first.is_ascii_alphabetic() && *first != b'_' {
-                    return Err("expected storage field after 'self.'".to_string());
+                    return Err("expected identifier after '.'".to_string());
                 }
                 position += 1;
                 while position < bytes.len()
@@ -951,7 +961,7 @@ fn lex_expression(source: &str) -> Result<Vec<ExprToken>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lithovm::{Storage, Vm, BASE_CALL_GAS, PARAMETER_GAS};
+    use lithovm::{ExecutionContext, Storage, Vm, BASE_CALL_GAS, PARAMETER_GAS};
 
     #[test]
     fn compiler_and_native_runtime_execute_the_same_artifact() {
@@ -1073,8 +1083,8 @@ mod tests {
             "contract C { pub fn choose(value: u64, limit: u64) -> u64 { let doubled: u64 = value * 2; if doubled < limit { return doubled; } else { let fallback = limit + 1; return fallback; } } }",
         )
         .unwrap();
-        assert_eq!(artifact.target, "lithovm-native-v3");
-        assert_eq!(artifact.bytecode_version, 3);
+        assert_eq!(artifact.target, "lithovm-native-v4");
+        assert_eq!(artifact.bytecode_version, 4);
         let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
         let vm = Vm::default();
 
@@ -1201,5 +1211,75 @@ mod tests {
                 "missing '{expected}' for {source}"
             );
         }
+    }
+
+    #[test]
+    fn compiles_and_executes_explicit_host_context() {
+        let artifact = compile(
+            "contract Context { pub fn sender() -> address { return msg.sender; } pub fn value() -> u256 { return msg.value; } pub fn height() -> u64 { return block.height; } pub fn timestamp() -> u64 { return block.timestamp; } pub fn chain() -> u64 { return chain.id; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let mut caller = [0; 32];
+        caller[12..].copy_from_slice(&[7; 20]);
+        let context = ExecutionContext {
+            caller,
+            value: word_from_u64(25),
+            block_height: 91,
+            block_timestamp: 1_725_000_000,
+            chain_id: 9005,
+        };
+        let vm = Vm::default();
+
+        assert!(vm.execute(&bytes, "sender", &[], 100).is_err());
+        for (name, expected) in [
+            ("sender", caller),
+            ("value", word_from_u64(25)),
+            ("height", word_from_u64(91)),
+            ("timestamp", word_from_u64(1_725_000_000)),
+            ("chain", word_from_u64(9005)),
+        ] {
+            assert_eq!(
+                vm.execute_with_context(&bytes, name, &[], 100, &context)
+                    .unwrap()
+                    .return_value,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn context_storage_execution_remains_transactional() {
+        let artifact = compile(
+            "contract ContextState { state { last: u64; } pub fn record() -> u64 { self.last = block.timestamp; return self.last; } }",
+        )
+        .unwrap();
+        let bytes = hex::decode(&artifact.bytecode[2..]).unwrap();
+        let vm = Vm::default();
+        let mut storage = Storage::default();
+        let context = ExecutionContext {
+            block_timestamp: 1234,
+            chain_id: 9005,
+            ..ExecutionContext::default()
+        };
+
+        assert!(vm
+            .execute_with_storage(&bytes, "record", &[], 100, &mut storage)
+            .is_err());
+        assert_eq!(storage.get("last"), None);
+        assert_eq!(
+            vm.execute_with_storage_and_context(
+                &bytes,
+                "record",
+                &[],
+                100,
+                &mut storage,
+                &context,
+            )
+            .unwrap()
+            .return_value,
+            word_from_u64(1234)
+        );
+        assert_eq!(storage.get("last"), Some(&word_from_u64(1234)));
     }
 }

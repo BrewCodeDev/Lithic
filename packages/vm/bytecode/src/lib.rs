@@ -3,7 +3,8 @@ use anyhow::{anyhow, bail, Result};
 pub const MAGIC: &[u8; 7] = b"LITHOVM";
 pub const LEGACY_VERSION: u8 = 1;
 pub const STATEMENT_VERSION: u8 = 2;
-pub const VERSION: u8 = 3;
+pub const STORAGE_VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const MAX_FUNCTIONS: usize = 1024;
 pub const MAX_PARAMETERS: usize = 64;
 pub const MAX_NAME_BYTES: usize = 255;
@@ -77,6 +78,11 @@ pub enum Instruction {
     Parameter(u16),
     Local(u16),
     Storage(u16),
+    MessageSender,
+    MessageValue,
+    BlockHeight,
+    BlockTimestamp,
+    ChainId,
     AddU64,
     SubU64,
     MulU64,
@@ -157,7 +163,7 @@ pub fn parse(bytes: &[u8]) -> Result<Program> {
     if !(LEGACY_VERSION..=VERSION).contains(&version) {
         bail!("unsupported LithoVM bytecode version {version}");
     }
-    let storage = if version >= VERSION {
+    let storage = if version >= STORAGE_VERSION {
         let field_count = reader.u16()? as usize;
         if field_count > MAX_STORAGE_FIELDS {
             bail!("too many LithoVM storage fields: {field_count}");
@@ -409,6 +415,11 @@ fn encode_instruction(bytes: &mut Vec<u8>, instruction: &Instruction) {
             bytes.push(10);
             bytes.extend_from_slice(&index.to_be_bytes());
         }
+        Instruction::MessageSender => bytes.push(11),
+        Instruction::MessageValue => bytes.push(12),
+        Instruction::BlockHeight => bytes.push(13),
+        Instruction::BlockTimestamp => bytes.push(14),
+        Instruction::ChainId => bytes.push(15),
         Instruction::AddU64 => bytes.push(3),
         Instruction::SubU64 => bytes.push(4),
         Instruction::MulU64 => bytes.push(5),
@@ -435,7 +446,12 @@ fn decode_instruction(reader: &mut Reader<'_>, version: u8) -> Result<Instructio
         7 => Ok(Instruction::Eq),
         8 => Ok(Instruction::LtU64),
         9 if version >= STATEMENT_VERSION => Ok(Instruction::Local(reader.u16()?)),
-        10 if version >= VERSION => Ok(Instruction::Storage(reader.u16()?)),
+        10 if version >= STORAGE_VERSION => Ok(Instruction::Storage(reader.u16()?)),
+        11 if version >= VERSION => Ok(Instruction::MessageSender),
+        12 if version >= VERSION => Ok(Instruction::MessageValue),
+        13 if version >= VERSION => Ok(Instruction::BlockHeight),
+        14 if version >= VERSION => Ok(Instruction::BlockTimestamp),
+        15 if version >= VERSION => Ok(Instruction::ChainId),
         opcode => bail!("unknown LithoVM instruction opcode {opcode}"),
     }
 }
@@ -473,7 +489,7 @@ fn decode_statements(reader: &mut Reader<'_>, version: u8, depth: usize) -> Resu
                 then_branch: decode_statements(reader, version, depth + 1)?,
                 else_branch: decode_statements(reader, version, depth + 1)?,
             },
-            4 if version >= VERSION => Statement::Store {
+            4 if version >= STORAGE_VERSION => Statement::Store {
                 field: reader.u16()?,
                 expression: decode_expression(reader, version)?,
             },
@@ -516,6 +532,11 @@ fn validate_expression(
                     .ok_or_else(|| anyhow!("expression storage index {index} is out of range"))?
                     .value_type,
             ),
+            Instruction::MessageSender => stack.push(ValueType::Address),
+            Instruction::MessageValue => stack.push(ValueType::U256),
+            Instruction::BlockHeight | Instruction::BlockTimestamp | Instruction::ChainId => {
+                stack.push(ValueType::U64)
+            }
             Instruction::AddU64
             | Instruction::SubU64
             | Instruction::MulU64
@@ -747,6 +768,9 @@ mod tests {
         };
         let bytes = program.encode().unwrap();
         assert_eq!(parse(&bytes).unwrap(), program);
+        let mut v3 = bytes.clone();
+        v3[MAGIC.len()] = STORAGE_VERSION;
+        assert_eq!(parse(&v3).unwrap(), program);
 
         let mut invalid = program;
         invalid.functions[0].return_value = ReturnValue::Expression(vec![Instruction::AddU64]);
@@ -797,13 +821,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_and_v2_artifacts_remain_readable() {
+    fn older_artifact_versions_remain_readable() {
         for version in [LEGACY_VERSION, STATEMENT_VERSION] {
             let mut bytes = sample().encode().unwrap();
             bytes[MAGIC.len()] = version;
             bytes.drain(MAGIC.len() + 1..MAGIC.len() + 3);
             assert_eq!(parse(&bytes).unwrap(), sample());
         }
+
+        let mut v3 = sample().encode().unwrap();
+        v3[MAGIC.len()] = STORAGE_VERSION;
+        assert_eq!(parse(&v3).unwrap(), sample());
     }
 
     #[test]
@@ -828,6 +856,9 @@ mod tests {
         };
         let bytes = program.encode().unwrap();
         assert_eq!(parse(&bytes).unwrap(), program);
+        let mut storage_v3 = bytes.clone();
+        storage_v3[MAGIC.len()] = STORAGE_VERSION;
+        assert_eq!(parse(&storage_v3).unwrap(), program);
 
         let mut invalid = program;
         invalid.functions[0].return_value = ReturnValue::Statements(vec![
@@ -838,5 +869,31 @@ mod tests {
             Statement::Return(vec![Instruction::Storage(0)]),
         ]);
         assert!(invalid.encode().is_err());
+    }
+
+    #[test]
+    fn execution_context_instructions_round_trip_with_static_types() {
+        for (instruction, return_type) in [
+            (Instruction::MessageSender, ValueType::Address),
+            (Instruction::MessageValue, ValueType::U256),
+            (Instruction::BlockHeight, ValueType::U64),
+            (Instruction::BlockTimestamp, ValueType::U64),
+            (Instruction::ChainId, ValueType::U64),
+        ] {
+            let program = Program {
+                storage: vec![],
+                functions: vec![Function {
+                    name: "context".into(),
+                    parameters: vec![],
+                    return_type,
+                    return_value: ReturnValue::Expression(vec![instruction]),
+                }],
+            };
+            let bytes = program.encode().unwrap();
+            assert_eq!(parse(&bytes).unwrap(), program);
+            let mut mislabeled_v3 = bytes;
+            mislabeled_v3[MAGIC.len()] = STORAGE_VERSION;
+            assert!(parse(&mislabeled_v3).is_err());
+        }
     }
 }

@@ -19,6 +19,15 @@ pub struct ExecutionResult {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionContext {
+    pub caller: [u8; 32],
+    pub value: [u8; 32],
+    pub block_height: u64,
+    pub block_timestamp: u64,
+    pub chain_id: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Storage {
     values: BTreeMap<String, [u8; 32]>,
 }
@@ -63,7 +72,38 @@ impl Vm {
             bail!("stateful LithoVM program requires execute_with_storage");
         }
         let mut storage = Storage::default();
-        execute_program(&program, function_name, arguments, gas_limit, &mut storage)
+        execute_program(
+            &program,
+            function_name,
+            arguments,
+            gas_limit,
+            &mut storage,
+            None,
+        )
+    }
+
+    pub fn execute_with_context(
+        &self,
+        bytes: &[u8],
+        function_name: &str,
+        arguments: &[[u8; 32]],
+        gas_limit: u64,
+        context: &ExecutionContext,
+    ) -> Result<ExecutionResult> {
+        let program = parse(bytes)?;
+        if !program.storage.is_empty() {
+            bail!("stateful LithoVM program requires execute_with_storage_and_context");
+        }
+        validate_context(context)?;
+        let mut storage = Storage::default();
+        execute_program(
+            &program,
+            function_name,
+            arguments,
+            gas_limit,
+            &mut storage,
+            Some(context),
+        )
     }
 
     pub fn execute_with_storage(
@@ -77,7 +117,39 @@ impl Vm {
         let program = parse(bytes)?;
         let mut staged = storage.clone();
         prepare_storage(&program, &mut staged)?;
-        let result = execute_program(&program, function_name, arguments, gas_limit, &mut staged)?;
+        let result = execute_program(
+            &program,
+            function_name,
+            arguments,
+            gas_limit,
+            &mut staged,
+            None,
+        )?;
+        *storage = staged;
+        Ok(result)
+    }
+
+    pub fn execute_with_storage_and_context(
+        &self,
+        bytes: &[u8],
+        function_name: &str,
+        arguments: &[[u8; 32]],
+        gas_limit: u64,
+        storage: &mut Storage,
+        context: &ExecutionContext,
+    ) -> Result<ExecutionResult> {
+        let program = parse(bytes)?;
+        validate_context(context)?;
+        let mut staged = storage.clone();
+        prepare_storage(&program, &mut staged)?;
+        let result = execute_program(
+            &program,
+            function_name,
+            arguments,
+            gas_limit,
+            &mut staged,
+            Some(context),
+        )?;
         *storage = staged;
         Ok(result)
     }
@@ -106,6 +178,7 @@ fn execute_program(
     arguments: &[[u8; 32]],
     gas_limit: u64,
     storage: &mut Storage,
+    context: Option<&ExecutionContext>,
 ) -> Result<ExecutionResult> {
     let function = program
         .functions
@@ -135,6 +208,11 @@ fn execute_program(
     if gas_limit < gas_used {
         bail!("out of gas: requires {gas_used}, limit is {gas_limit}");
     }
+    let mut environment = RuntimeEnvironment {
+        storage_fields: &program.storage,
+        storage,
+        context,
+    };
     let return_value = match &function.return_value {
         ReturnValue::Constant(word) => word,
         ReturnValue::Parameter(index) => &arguments[*index as usize],
@@ -145,8 +223,7 @@ fn execute_program(
                 &function.parameters,
                 function.return_type,
                 gas_used,
-                &program.storage,
-                storage,
+                &environment,
             )
         }
         ReturnValue::Statements(statements) => {
@@ -157,7 +234,7 @@ fn execute_program(
                 function.return_type,
                 gas_used,
                 gas_limit,
-                (&program.storage, storage),
+                &mut environment,
             )
         }
     };
@@ -166,6 +243,13 @@ fn execute_program(
         return_value: *return_value,
         gas_used,
     })
+}
+
+fn validate_context(context: &ExecutionContext) -> Result<()> {
+    validate_word(ValueType::Address, &context.caller)
+        .map_err(|error| anyhow!("execution context caller: {error}"))?;
+    validate_word(ValueType::U256, &context.value)
+        .map_err(|error| anyhow!("execution context value: {error}"))
 }
 
 fn prepare_storage(program: &Program, storage: &mut Storage) -> Result<()> {
@@ -188,23 +272,21 @@ struct StackValue {
     word: [u8; 32],
 }
 
+struct RuntimeEnvironment<'a> {
+    storage_fields: &'a [lithovm_bytecode::StorageField],
+    storage: &'a mut Storage,
+    context: Option<&'a ExecutionContext>,
+}
+
 fn execute_expression(
     instructions: &[Instruction],
     arguments: &[[u8; 32]],
     parameter_types: &[ValueType],
     return_type: ValueType,
     gas_used: u64,
-    storage_fields: &[lithovm_bytecode::StorageField],
-    storage: &Storage,
+    environment: &RuntimeEnvironment<'_>,
 ) -> Result<ExecutionResult> {
-    let result = evaluate_expression(
-        instructions,
-        arguments,
-        parameter_types,
-        &[],
-        storage_fields,
-        storage,
-    )?;
+    let result = evaluate_expression(instructions, arguments, parameter_types, &[], environment)?;
     validate_word(return_type, &result.word)?;
     if result.value_type != return_type {
         bail!("expression runtime type does not match function return type");
@@ -221,8 +303,7 @@ fn evaluate_expression(
     arguments: &[[u8; 32]],
     parameter_types: &[ValueType],
     locals: &[StackValue],
-    storage_fields: &[lithovm_bytecode::StorageField],
-    storage: &Storage,
+    environment: &RuntimeEnvironment<'_>,
 ) -> Result<StackValue> {
     let mut stack: Vec<StackValue> = Vec::new();
     for instruction in instructions {
@@ -241,16 +322,62 @@ fn evaluate_expression(
                     .ok_or_else(|| anyhow!("runtime local index {index} is out of range"))?,
             ),
             Instruction::Storage(index) => {
-                let field = storage_fields
+                let field = environment
+                    .storage_fields
                     .get(*index as usize)
                     .ok_or_else(|| anyhow!("runtime storage index {index} is out of range"))?;
-                let word = storage
-                    .values
-                    .get(&field.name)
-                    .ok_or_else(|| anyhow!("runtime storage field '{}' is missing", field.name))?;
+                let word =
+                    environment.storage.values.get(&field.name).ok_or_else(|| {
+                        anyhow!("runtime storage field '{}' is missing", field.name)
+                    })?;
                 stack.push(StackValue {
                     value_type: field.value_type,
                     word: *word,
+                });
+            }
+            Instruction::MessageSender => {
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contextual program requires an execution context"))?;
+                stack.push(StackValue {
+                    value_type: ValueType::Address,
+                    word: context.caller,
+                });
+            }
+            Instruction::MessageValue => {
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contextual program requires an execution context"))?;
+                stack.push(StackValue {
+                    value_type: ValueType::U256,
+                    word: context.value,
+                });
+            }
+            Instruction::BlockHeight => {
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contextual program requires an execution context"))?;
+                stack.push(StackValue {
+                    value_type: ValueType::U64,
+                    word: word_from_u64(context.block_height),
+                });
+            }
+            Instruction::BlockTimestamp => {
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contextual program requires an execution context"))?;
+                stack.push(StackValue {
+                    value_type: ValueType::U64,
+                    word: word_from_u64(context.block_timestamp),
+                });
+            }
+            Instruction::ChainId => {
+                let context = environment
+                    .context
+                    .ok_or_else(|| anyhow!("contextual program requires an execution context"))?;
+                stack.push(StackValue {
+                    value_type: ValueType::U64,
+                    word: word_from_u64(context.chain_id),
                 });
             }
             Instruction::AddU64 => {
@@ -321,9 +448,8 @@ fn execute_statements(
     return_type: ValueType,
     base_gas: u64,
     gas_limit: u64,
-    storage_context: (&[lithovm_bytecode::StorageField], &mut Storage),
+    environment: &mut RuntimeEnvironment<'_>,
 ) -> Result<ExecutionResult> {
-    let (storage_fields, storage) = storage_context;
     let mut meter = GasMeter {
         used: base_gas,
         limit: gas_limit,
@@ -342,8 +468,7 @@ fn execute_statements(
         parameter_types,
         &mut locals,
         &mut meter,
-        storage_fields,
-        storage,
+        environment,
     )?;
     if result.value_type != return_type {
         bail!("statement return type does not match function return type");
@@ -362,8 +487,7 @@ fn execute_block(
     parameter_types: &[ValueType],
     locals: &mut Vec<StackValue>,
     meter: &mut GasMeter,
-    storage_fields: &[lithovm_bytecode::StorageField],
-    storage: &mut Storage,
+    environment: &mut RuntimeEnvironment<'_>,
 ) -> Result<StackValue> {
     for statement in statements {
         meter.charge(INSTRUCTION_GAS)?;
@@ -378,8 +502,7 @@ fn execute_block(
                     arguments,
                     parameter_types,
                     locals,
-                    storage_fields,
-                    storage,
+                    environment,
                 )?;
                 if value.value_type != *value_type {
                     bail!("local binding runtime type mismatch");
@@ -393,13 +516,13 @@ fn execute_block(
                     arguments,
                     parameter_types,
                     locals,
-                    storage_fields,
-                    storage,
+                    environment,
                 );
             }
             Statement::Store { field, expression } => {
                 meter.charge(INSTRUCTION_GAS.saturating_mul(expression.len() as u64))?;
-                let field = storage_fields
+                let field = environment
+                    .storage_fields
                     .get(*field as usize)
                     .ok_or_else(|| anyhow!("runtime store field index is out of range"))?;
                 let value = evaluate_expression(
@@ -407,14 +530,16 @@ fn execute_block(
                     arguments,
                     parameter_types,
                     locals,
-                    storage_fields,
-                    storage,
+                    environment,
                 )?;
                 if value.value_type != field.value_type {
                     bail!("storage write runtime type mismatch");
                 }
                 validate_word(field.value_type, &value.word)?;
-                storage.values.insert(field.name.clone(), value.word);
+                environment
+                    .storage
+                    .values
+                    .insert(field.name.clone(), value.word);
             }
             Statement::If {
                 condition,
@@ -427,8 +552,7 @@ fn execute_block(
                     arguments,
                     parameter_types,
                     locals,
-                    storage_fields,
-                    storage,
+                    environment,
                 )?;
                 if condition.value_type != ValueType::Bool {
                     bail!("if condition runtime type is not bool");
@@ -447,8 +571,7 @@ fn execute_block(
                     parameter_types,
                     locals,
                     meter,
-                    storage_fields,
-                    storage,
+                    environment,
                 );
                 locals.truncate(local_count);
                 return result;
