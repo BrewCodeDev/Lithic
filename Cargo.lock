@@ -1285,6 +1285,7 @@ name = "lithc"
 version = "0.2.0"
 dependencies = [
  "lithic-evm",
+ "lithic-lithovm",
  "lithic-syntax",
 ]
 
@@ -1305,6 +1306,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+]
+
+[[package]]
+name = "lithic-lithovm"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "lithic-syntax",
+ "lithovm",
+ "lithovm-bytecode",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

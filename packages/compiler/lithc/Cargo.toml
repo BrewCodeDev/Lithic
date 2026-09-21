@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 lithic-evm = { path = "../lithic-evm" }
+lithic-lithovm = { path = "../lithic-lithovm" }
 lithic-syntax = { path = "../lithic-syntax" }

@@ -1,7 +1,7 @@
 //! `lithc` — the Lithic compiler.
 //!
-//! The command exposes declaration checks and a fail-closed EVM backend for
-//! the currently supported stateless language subset.
+//! The command exposes declaration checks and fail-closed EVM and native
+//! LithoVM backends for the currently supported stateless language subset.
 
 use std::process::exit;
 
@@ -13,7 +13,8 @@ USAGE:
     lithc [OPTIONS] <FILE.lithic>
 
 OPTIONS:
-    --emit <KIND>   summary (default), ast, abi, check, evm, bytecode, runtime
+    --emit <KIND>   summary (default), ast, abi, check, evm, bytecode, runtime,
+                    lithovm, lithovm-bytecode
     -h, --help      Print this help
 
 EXAMPLES:
@@ -21,9 +22,10 @@ EXAMPLES:
     lithc --emit abi DOGE.lithic
     lithc --emit check DOGE.lithic
     lithc --emit evm apps/examples/frontend/evm-constants.lithic
+    lithc --emit lithovm apps/examples/frontend/evm-constants.lithic
 
-EVM output supports stateless public functions returning a constant or a
-same-typed static parameter.
+EVM and native LithoVM output support stateless public functions returning a
+constant or a same-typed static parameter.
 Unsupported semantics reject the complete build."#,
         env!("CARGO_PKG_VERSION")
     );
@@ -81,6 +83,11 @@ fn main() {
         return;
     }
 
+    if matches!(emit.as_str(), "lithovm" | "lithovm-bytecode") {
+        emit_lithovm(&src, &emit);
+        return;
+    }
+
     let res = lithic_syntax::parse(&src);
     for d in &res.diagnostics {
         eprintln!("{}", d.render(&src, &path));
@@ -120,10 +127,26 @@ fn main() {
         "abi" => println!("{}", contract.to_abi_json()),
         other => {
             eprintln!(
-                "lithc: error: unknown emit kind '{}' (expected summary|ast|abi|check|evm|bytecode|runtime)",
+                "lithc: error: unknown emit kind '{}' (expected summary|ast|abi|check|evm|bytecode|runtime|lithovm|lithovm-bytecode)",
                 other
             );
             exit(2);
+        }
+    }
+}
+
+fn emit_lithovm(source: &str, emit: &str) {
+    match lithic_lithovm::compile(source) {
+        Ok(artifact) => match emit {
+            "lithovm" => println!("{}", artifact.to_json()),
+            "lithovm-bytecode" => println!("{}", artifact.bytecode),
+            _ => unreachable!(),
+        },
+        Err(error) => {
+            for message in error.messages() {
+                eprintln!("lithc: error: {message}");
+            }
+            exit(1);
         }
     }
 }

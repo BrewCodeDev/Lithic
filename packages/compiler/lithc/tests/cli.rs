@@ -100,3 +100,46 @@ fn evm_mode_rejects_unsupported_stateful_source() {
         .contains("state fields are not supported by the v1 EVM backend"));
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn lithovm_mode_emits_a_versioned_native_artifact() {
+    let path = source_file(
+        "lithovm",
+        "contract C { pub fn answer() -> u64 { return 42; } }",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_lithc"))
+        .args(["--emit", "lithovm"])
+        .arg(&path)
+        .output()
+        .expect("run lithc");
+    fs::remove_file(&path).expect("remove Lithic fixture");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"target\": \"lithovm-native-v1\""));
+    assert!(stdout.contains("\"bytecodeVersion\": 1"));
+    assert!(stdout.contains("\"bytecode\": \"0x4c4954484f564d01"));
+}
+
+#[test]
+fn lithovm_mode_rejects_unsupported_stateful_source() {
+    let path = source_file(
+        "lithovm-state",
+        "contract C { state { value: u64; } pub fn answer() -> u64 { return 42; } }",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_lithc"))
+        .args(["--emit", "lithovm"])
+        .arg(&path)
+        .output()
+        .expect("run lithc");
+    fs::remove_file(&path).expect("remove Lithic fixture");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("state fields are not supported by native LithoVM bytecode v1"));
+    assert!(output.stdout.is_empty());
+}
